@@ -12,390 +12,405 @@ Outputs:
   - (optional) For each table, fetched URLs saved under <group>/<urls-subdir>/ with a per-group _manifest.csv
 """
 
-import sys
-import os
-import io
-import csv
-from pathlib import Path
-from typing import Optional
-
-import pandas as pd
+from __future__ import annotations
 
 import argparse
+import csv
 import re
-import hashlib
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, Optional, Tuple, List, Dict
+
 import requests
-from urllib.parse import urlparse
-from typing import List, Dict
+import pandas as pd
 
-# ---------- helpers ----------
+# ---------- Configuration ----------
 
-def sniff_delimiter(p: Path, max_bytes: int = 8192) -> Optional[str]:
-    """Try to infer CSV delimiter using csv.Sniffer on the first `max_bytes`."""
-    try:
-        with p.open("rb") as f:
-            sample = f.read(max_bytes)
-        # try common encodings quickly
-        for enc in ("utf-8", "utf-8-sig", "latin-1"):
-            try:
-                text = sample.decode(enc, errors="strict")
-                dialect = csv.Sniffer().sniff(text, delimiters=[",", ";", "\t", "|", ":"])
-                return dialect.delimiter
-            except Exception:
-                continue
-    except Exception:
-        pass
-    return None
+PREVIEW_DIR = Path("previews")
+PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
 
-def read_csv_head(p: Path, nrows: int = 4) -> pd.DataFrame:
-    """Read first `nrows` of a CSV, robust to unknown delimiter/encoding."""
-    # Let pandas try to infer delimiter; fallbacks on encoding
-    for enc in ("utf-8", "utf-8-sig", "latin-1"):
-        try:
-            return pd.read_csv(
-                p,
-                nrows=nrows,
-                sep=None,              # infer
-                engine="python",       # needed for sep=None
-                encoding=enc,
-                on_bad_lines="skip",
-            )
-        except Exception:
+# canonical headers we’ll normalize to
+CANON = ["quote_from_report", "file_name", "quote_from_source"]
+
+# simple URL recognizer (tolerant)
+URL_RE = re.compile(r"""(?ix)
+\b(https?://[^\s<>'"]+)
+""")
+
+# columns that are likely to contain URLs
+LIKELY_URL_COLNAMES = {
+    "url", "link", "source_url", "web", "website", "doi", "pdf_url"
+}
+
+# (Optional) If you ever want to only fetch “document-like” URLs, you can use this list.
+DOC_EXTS = (".pdf", ".doc", ".docx", ".rtf", ".txt")
+
+
+@dataclass
+class TableSpec:
+    group_dir: Path
+    table_path: Path
+    is_excel: bool
+    sheet_name: Optional[str] = None
+
+
+def find_tables(root: Path) -> Iterable[TableSpec]:
+    """
+    Yield TableSpec for each CSV or Excel file under root/<group>/*.
+    Preference order for a group: if both CSV and XLSX exist with same stem,
+    the Excel version will be *preferred* later (we’ll still preview both).
+    """
+    for group in sorted(p for p in root.iterdir() if p.is_dir()):
+        csvs = sorted(group.glob("*.csv"))
+        xls = sorted(group.glob("*.xls")) + sorted(group.glob("*.xlsx"))
+        for p in csvs:
+            yield TableSpec(group, p, is_excel=False)
+        for p in xls:
+            yield TableSpec(group, p, is_excel=True)
+
+
+def normalize_header_names(cols: List[str]) -> List[str]:
+    """
+    Map common variants to canonical headers: quote_from_report, file_name, quote_from_source.
+    Leaves everything else as-is. We’ll collapse to first 3 logical columns later if needed.
+    """
+    out = []
+    for c in cols:
+        if c is None:
+            out.append(c)
             continue
-    # Last resort: assume comma + permissive encoding
-    return pd.read_csv(
-        p,
-        nrows=nrows,
-        sep=",",
-        engine="python",
-        encoding="latin-1",
-        on_bad_lines="skip",
-    )
+        k = str(c).strip().lower()
+        k = re.sub(r"\s+", " ", k)
+        k = k.replace("’", "'").replace("“", '"').replace("”", '"')
 
-def sanitize(name: str) -> str:
-    return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in name)
-
-def _drop_empty_unnamed(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Drop columns that (a) are named like 'Unnamed: N' and (b) are entirely empty/NA/whitespace.
-    This handles messy Excel sheets with thousands of blank columns created by merged cells.
-    """
-    keep_cols = []
-    for c in df.columns:
-        s = df[c]
-        # treat non-string gracefully
-        s_str = s.astype(str).str.strip()
-        all_empty = s.isna().all() or (s_str.eq("").all())
-        if isinstance(c, str) and c.startswith("Unnamed:") and all_empty:
-            continue
-        keep_cols.append(c)
-    return df.loc[:, keep_cols]
-
-def _print_columns_capped(df: pd.DataFrame, prefix: str = "columns=") -> str:
-    cols = list(df.columns)
-    cap = 20
-    if len(cols) <= cap:
-        return f"{prefix}{cols}"
-    head = cols[:cap]
-    return f"{prefix}{head} ... (+{len(cols)-cap} more)"
-
-def normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Normalize messy student headers into a canonical trio where possible:
-    quote_from_report, file_name, quote_from_source.
-    Non-matching headers are left as-is.
-    """
-    def norm(s: str) -> str:
-        s = (s or "").replace("\ufeff", "")  # strip BOM
-        s = re.sub(r"\s+", " ", s).strip().lower()
-        return s
-
-    mapping = {
-        "quote from report": "quote_from_report",
-        "quote in our report": "quote_from_report",
-        "text in report": "quote_from_report",
-        "section in report": "quote_from_report",
-        "text from report": "quote_from_report",
-        "assignment 1 citations": "quote_from_report",
-
-        "quote from source": "quote_from_source",
-        "used text from source": "quote_from_source",
-        "in-tekst ref": "quote_from_source",
-        "qoute from source": "quote_from_source",
-        "quote from resource": "quote_from_source",
-        "text in source": "quote_from_source",
-        "used text from source ": "quote_from_source",
-        "quote from source ": "quote_from_source",
-
-        "file name": "file_name",
-        "file name ": "file_name",
-        "file": "file_name",
-        "source": "file_name",
-        "file name  ": "file_name",
-        "file name\u00a0": "file_name",  # handles non-breaking space
-    }
-
-    new_cols = []
-    for c in df.columns:
-        c_norm = norm(str(c))
-        new_cols.append(mapping.get(c_norm, c))
-    df.columns = new_cols
-    return df
-
-# ---------- URL helpers ----------
-
-URL_RE = re.compile(r"https?://\S+", re.I)
-
-def extract_urls_from_table(p: Path, max_rows: int = 2000) -> List[Dict]:
-    """Scan a CSV/XLS/XLSM for URLs; return list of {'url','cell','sheet'}."""
-    out: List[Dict] = []
-    try:
-        if p.suffix.lower() == ".csv":
-            df = pd.read_csv(p, dtype=str, keep_default_na=False, encoding_errors="ignore", nrows=max_rows)
-            sheet = None
-        elif p.suffix.lower() == ".tsv":
-            df = pd.read_csv(p, dtype=str, keep_default_na=False, encoding_errors="ignore", sep="\t", nrows=max_rows)
-            sheet = None
+        if k in {"quote from report", "text in report", "quote in our report", "assignment 1 citations"}:
+            out.append("quote_from_report")
+        elif k in {"file name", "file name ", "filename", "source", "source file", "file", "file_name"}:
+            out.append("file_name")
+        elif k in {"quote from source", "used text from source", "text from source", "quote from resource", "qoute from source"}:
+            out.append("quote_from_source")
         else:
-            xl = pd.ExcelFile(p)
-            if not xl.sheet_names:
-                return out
-            sheet = xl.sheet_names[0]
-            df = pd.read_excel(
-                p,
-                sheet_name=sheet,
-                dtype=str,
-                nrows=max_rows,
-                engine="openpyxl" if p.suffix.lower() == ".xlsx" else None
-            )
-        for r_idx, row in df.iterrows():
-            for c_name, val in row.items():
-                s = str(val).strip()
-                if not s:
-                    continue
-                m = URL_RE.search(s)
-                if m:
-                    out.append({
-                        "url": m.group(0),
-                        "cell": f"row={r_idx}, col={c_name}",
-                        "sheet": sheet
-                    })
-    except Exception:
-        pass
+            out.append(k)
     return out
 
-def sha256_bytes(b: bytes) -> str:
-    return hashlib.sha256(b).hexdigest()
 
-def safe_name(s: str) -> str:
-    return "".join(ch if ch.isalnum() or ch in ("-", "_", ".", "+") else "_" for ch in s)
-
-def guess_ext_from_ct(ct: str | None) -> str:
-    if not ct:
-        return ""
-    ct = ct.split(";")[0].strip().lower()
-    return {
-        "text/html": ".html",
-        "application/pdf": ".pdf",
-        "text/plain": ".txt",
-        "application/msword": ".doc",
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
-    }.get(ct, "")
-
-def fetch_url(url: str, timeout: int = 20) -> tuple[bool, Dict]:
-    """Fetch URL; return (ok, meta) where meta includes status, content_type, bytes, sha256, filename, content (bytes) or error."""
-    meta: Dict = {"status": None, "content_type": None, "error": None, "bytes": 0, "sha256": None, "filename": None}
+def try_read_csv(path: Path) -> Tuple[pd.DataFrame, Optional[str]]:
+    """
+    Robust CSV reader: sniff delimiter, try multiple encodings and engines,
+    tolerate bad lines. Returns (df, delimiter_guess)
+    """
+    # Attempt basic sniff (best-effort)
+    delim = None
     try:
-        headers = {"User-Agent": "student-sidecar/1.0 (+https://example.local)"}
-        r = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
-        meta["status"] = r.status_code
-        if r.status_code != 200 or not r.content:
-            meta["error"] = f"HTTP {r.status_code}"
-            return False, meta
-        meta["content_type"] = r.headers.get("Content-Type", "")
-        meta["bytes"] = len(r.content)
-        meta["sha256"] = sha256_bytes(r.content)
-        parsed = urlparse(url)
-        base = safe_name(parsed.path.split("/")[-1]) or "download"
-        ext = Path(base).suffix
-        if not ext:
-            ext = guess_ext_from_ct(meta["content_type"]) or ""
-        meta["filename"] = (base if ext else base) + ext
-        meta["content"] = r.content
-        return True, meta
-    except Exception as e:
-        meta["error"] = str(e)
-        return False, meta
+        with path.open("r", encoding="utf-8", errors="ignore") as f:
+            sample = f.read(4096)
+        sniffer = csv.Sniffer()
+        dialect = sniffer.sniff(sample)
+        delim = dialect.delimiter
+    except Exception:
+        delim = None
 
-def save_url_payload(group_dir: Path, urls_subdir: str, url: str, meta: Dict) -> Dict:
-    """Save fetched bytes under group/<urls_subdir>/<sha256>.<ext>; also derive HTML text companion if possible."""
-    out_dir = group_dir / urls_subdir
-    out_dir.mkdir(parents=True, exist_ok=True)
-    ext = Path(meta.get("filename") or "").suffix
-    sha = meta["sha256"]
-    bin_path = out_dir / f"{sha}{ext}"
-    if not bin_path.exists():
-        bin_path.write_bytes(meta["content"])
-    text_path = None
-    ct = (meta.get("content_type") or "").split(";")[0].lower()
-    if ct == "text/html":
-        try:
-            import trafilatura
-            txt = trafilatura.extract(
-                meta["content"].decode("utf-8", errors="ignore"),
-                include_comments=False,
-                include_tables=False
-            ) or ""
-            if txt.strip():
-                text_path = out_dir / f"{sha}.txt"
-                text_path.write_text(txt, encoding="utf-8")
-        except Exception:
-            pass
-    return {"saved_path": str(bin_path), "text_path": str(text_path) if text_path else None}
+    encodings = ["utf-8", "utf-8-sig", "cp1252", "latin-1"]
+    engines = ["c", "python"]
 
-import csv as _csv
-def append_manifest_row(manifest_path: Path, row: Dict):
-    header = ["url","status","content_type","bytes","sha256","saved_path","text_path","source_table","source_cell","source_sheet","error"]
-    exists = manifest_path.exists()
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    with manifest_path.open("a", newline="", encoding="utf-8") as f:
-        w = _csv.DictWriter(f, fieldnames=header)
-        if not exists:
-            w.writeheader()
-        w.writerow({k: row.get(k) for k in header})
-
-def main(root: Path, fetch_urls: bool = False, urls_subdir: str = "urls", url_timeout: int = 20):
-    root = root.expanduser().resolve()
-    if not root.exists():
-        print(f"[ERROR] root path does not exist: {root}")
-        return
-    if not root.is_dir():
-        print(f"[ERROR] root path is not a directory: {root}")
-        return
-
-    previews_root = Path("previews")
-    previews_root.mkdir(parents=True, exist_ok=True)
-
-    exts_csv = {".csv", ".tsv"}
-    exts_xls = {".xlsx", ".xls", ".xlsm"}
-
-    files_seen = 0
-
-    for dirpath, _, filenames in os.walk(root):
-        for fname in filenames:
-            p = Path(dirpath) / fname
-            ext = p.suffix.lower()
-
-            if ext in exts_csv:
-                delim = sniff_delimiter(p) if ext == ".csv" else "\\t"
-                try:
-                    df = read_csv_head(p, nrows=4)
-                    df = normalize_headers(df)
-                    df = _drop_empty_unnamed(df)
-                except Exception as e:
-                    print(f"[CSV-ERROR] {p}: {e}")
-                    continue
-
-                print(
-                    f"[CSV] {p}\n"
-                    f"      delimiter={repr(delim)}  {_print_columns_capped(df)}  rows_shown={len(df)}"
+    last_err = None
+    for enc in encodings:
+        for eng in engines:
+            try:
+                df = pd.read_csv(
+                    path,
+                    dtype=str,
+                    on_bad_lines="skip",
+                    engine=eng,
+                    encoding=enc,
+                    sep=(delim if delim else None),  # prefer the sniffer if we got one
+                    encoding_errors="ignore",
                 )
-
+                return df, delim
+            except TypeError:
                 try:
-                    rel = p.relative_to(root)
-                except ValueError:
-                    rel = p
-                out_name = f"{sanitize(str(rel))}__head.csv"
-                out_path = previews_root / out_name
-                try:
-                    df.to_csv(out_path, index=False)
-                except Exception as e:
-                    print(f"   ↳ [write-failed] {out_path}: {e}")
-
-            elif ext in exts_xls:
-                try:
-                    xls = pd.ExcelFile(p)
-                    sheets = xls.sheet_names
-                except Exception as e:
-                    print(f"[XLS-ERROR] {p}: {e}")
-                    continue
-
-                print(f"[XLS/XLSX] {p}  sheets={sheets}")
-                if not sheets:
-                    print("   ↳ [sheet-error] no sheets found")
-                    continue
-
-                sheet = sheets[0]
-                try:
-                    df = pd.read_excel(
-                        p,
-                        sheet_name=sheet,
-                        nrows=4,
-                        engine="openpyxl" if ext == ".xlsx" else None,
+                    df = pd.read_csv(
+                        path,
+                        dtype=str,
+                        on_bad_lines="skip",
+                        engine=eng,
+                        encoding=enc,
+                        sep=(delim if delim else None),
                     )
-                    df = normalize_headers(df)
-                    df = _drop_empty_unnamed(df)
+                    return df, delim
                 except Exception as e:
-                    print(f"   ↳ [sheet-error] '{sheet}': {e}")
-                    continue
+                    last_err = e
+            except Exception as e:
+                last_err = e
 
-                print(f"   ↳ sheet='{sheet}'  {_print_columns_capped(df)}  rows_shown={len(df)}")
+    raise RuntimeError(f"[READ-ERROR] {path}: {last_err}")
 
-                try:
-                    rel = p.relative_to(root)
-                except ValueError:
-                    rel = p
-                out_name = f"{sanitize(str(rel))}__{sanitize(sheet)}__head.csv"
-                out_path = previews_root / out_name
-                try:
-                    df.to_csv(out_path, index=False)
-                except Exception as e:
-                    print(f"      [write-failed] {out_path}: {e}")
 
-            # --- URL discovery & optional fetch ---
-            if fetch_urls and (ext in exts_csv or ext in exts_xls):
-                try:
-                    hits = extract_urls_from_table(p, max_rows=2000)
-                except Exception:
-                    hits = []
-                if hits:
-                    # Save under the *group directory* = the parent folder of the table file.
-                    # (This is robust even if there is no cohort subfolder or if filenames are in the first level.)
-                    group_dir = p.parent
-                    manifest = group_dir / urls_subdir / "_manifest.csv"
-                    for hit in hits:
-                        ok, meta = fetch_url(hit["url"], timeout=url_timeout)
-                        saved = {"saved_path": None, "text_path": None}
-                        if ok:
-                            saved = save_url_payload(group_dir, urls_subdir, hit["url"], meta)
-                        append_manifest_row(manifest, {
-                            "url": hit["url"],
-                            "status": meta.get("status"),
-                            "content_type": meta.get("content_type"),
-                            "bytes": meta.get("bytes"),
-                            "sha256": meta.get("sha256"),
-                            "saved_path": saved.get("saved_path"),
-                            "text_path": saved.get("text_path"),
-                            "source_table": str(p),
-                            "source_cell": hit.get("cell"),
-                            "source_sheet": hit.get("sheet"),
-                            "error": meta.get("error"),
-                        })
+def read_excel_sheets(path: Path) -> Dict[str, pd.DataFrame]:
+    """Read all sheets from Excel (xlsx/xls) as str DF."""
+    try:
+        xls = pd.ExcelFile(path)
+        out: Dict[str, pd.DataFrame] = {}
+        for sheet in xls.sheet_names:
+            df = pd.read_excel(path, sheet_name=sheet, dtype=str, header=0)
+            out[sheet] = df
+        return out
+    except Exception as e:
+        raise RuntimeError(f"[READ-ERROR] {path}: {e}")
 
-            # ignore everything else
-            else:
+
+def get_excel_hyperlinks(path: Path) -> Dict[str, List[str]]:
+    """
+    Return a mapping of sheet_name -> list of hyperlink targets found via openpyxl.
+    Only works for .xlsx; silently returns {} for .xls or if openpyxl is unavailable.
+    """
+    links_by_sheet: Dict[str, List[str]] = {}
+    try:
+        from openpyxl import load_workbook  # type: ignore
+    except Exception:
+        return links_by_sheet
+
+    if path.suffix.lower() != ".xlsx":
+        return links_by_sheet
+
+    try:
+        wb = load_workbook(filename=str(path), data_only=True, read_only=True)
+        for ws in wb.worksheets:
+            found = []
+            for row in ws.iter_rows():
+                for cell in row:
+                    try:
+                        hl = getattr(cell, "hyperlink", None)
+                        if hl:
+                            target = getattr(hl, "target", None) or getattr(hl, "ref", None)
+                            if target and isinstance(target, str):
+                                found.append(target)
+                    except Exception:
+                        continue
+            if found:
+                links_by_sheet[ws.title] = found
+    except Exception:
+        return links_by_sheet
+    return links_by_sheet
+
+
+def collapse_to_first_three(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    If there are more than three “interesting” columns, try to collapse to the first 3 that look like
+    our canonical trio. Otherwise keep/pad the first 3 visible columns.
+    Always returns a DataFrame with up to 3 columns (pads with blanks if fewer).
+    """
+    if df is None or df.shape[1] == 0:
+        return pd.DataFrame({"_col0": []})
+
+    cols = normalize_header_names(list(df.columns))
+    df = df.copy()
+    df.columns = cols
+
+    has_canon = [c for c in CANON if c in df.columns]
+    if len(has_canon) == 3:
+        out = df[CANON].copy()
+    else:
+        picks: List[str] = []
+        for target in CANON:
+            for c in df.columns:
+                if c == target and c not in picks:
+                    picks.append(c)
+                    break
+        for c in df.columns:
+            if len(picks) >= 3:
+                break
+            if c not in picks:
+                picks.append(c)
+        out = df[picks[:3]].copy()
+
+    while out.shape[1] < 3:
+        out[f"_pad{out.shape[1]}"] = ""
+    out = out.iloc[:, :3]
+    return out
+
+
+def extract_urls_from_df(df: pd.DataFrame) -> List[str]:
+    urls = set()
+    for col in df.columns:
+        if str(col).strip().lower() in LIKELY_URL_COLNAMES:
+            for v in df[col].astype(str).fillna(""):
+                for m in URL_RE.findall(v):
+                    urls.add(m)
+        else:
+            for v in df[col].astype(str).fillna(""):
+                for m in URL_RE.findall(v):
+                    urls.add(m)
+    return sorted(urls)
+
+
+def sanitize_filename(name: str) -> str:
+    # remove pathy bits and illegal characters
+    name = name.split("/")[-1]
+    name = re.sub(r'[\\:*?"<>|]+', "_", name).strip()
+    return name or "download.bin"
+
+
+def fetch_url(url: str, dest: Path, timeout: int = 20) -> Optional[Path]:
+    """
+    Download URL to dest. Prefer filename from Content-Disposition; fall back to URL tail.
+    """
+    try:
+        r = requests.get(url, timeout=timeout, headers={"User-Agent": "student-sidecar/1.0"})
+        r.raise_for_status()
+
+        fname = None
+        cd = r.headers.get("Content-Disposition", "")
+        # try RFC 5987 or simple filename=
+        m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', cd, re.I)
+        if m:
+            fname = sanitize_filename(m.group(1))
+        if not fname:
+            tail = url.split("/")[-1].split("?")[0]
+            fname = sanitize_filename(tail if "." in tail else "download.bin")
+
+        out_path = dest / fname
+        with out_path.open("wb") as f:
+            f.write(r.content)
+        return out_path
+    except Exception:
+        return None
+
+
+def ensure_manifest(dirpath: Path) -> Path:
+    dirpath.mkdir(parents=True, exist_ok=True)
+    m = dirpath / "_manifest.csv"
+    if not m.exists():
+        with m.open("w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=["timestamp", "url", "saved_as"])
+            w.writeheader()
+    return m
+
+
+def append_manifest_row(manifest_path: Path, row: Dict[str, str]) -> None:
+    with manifest_path.open("a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["timestamp", "url", "saved_as"])
+        w.writerow(row)
+
+
+def _download_urls(urls: List[str], group_dir: Path, urls_subdir: str, url_timeout: int) -> None:
+    """Helper: download URLs into <group>/<urls_subdir>/, skipping duplicates, logging to _manifest.csv."""
+    if not urls:
+        return
+    url_dir = group_dir / urls_subdir
+    manifest = ensure_manifest(url_dir)
+
+    # set of already-existing filenames (for cheap dedupe)
+    existing = {p.name for p in url_dir.glob("*") if p.is_file()}
+
+    for u in urls:
+        if not u.lower().startswith("http"):
+            continue  # ignore local/file paths
+        # OPTIONAL: limit to doc-like URLs only
+        # if not any(u.lower().split("?", 1)[0].endswith(ext) for ext in DOC_EXTS):
+        #     continue
+
+        # Guess target name from URL to avoid needless re-fetch
+        guess = sanitize_filename(u.split("/")[-1].split("?")[0] or "download.bin")
+        if guess in existing:
+            append_manifest_row(manifest, {
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "url": u,
+                "saved_as": str(url_dir / guess)
+            })
+            continue
+
+        saved = fetch_url(u, url_dir, timeout=url_timeout)
+        append_manifest_row(manifest, {
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "url": u,
+            "saved_as": str(saved) if saved else ""
+        })
+
+
+def preview_and_optionally_fetch(spec: TableSpec, fetch_urls: bool, urls_subdir: str, url_timeout: int) -> None:
+    """
+    Read table, print preview to console, write 4-row head to previews/.
+    If fetch_urls=True, also download any URLs found into <group>/<urls_subdir>/ and
+    append to a per-group _manifest.csv.
+    """
+    rel_group = spec.group_dir.name
+    if spec.is_excel:
+        sheets = read_excel_sheets(spec.table_path)
+        print(f"[XLS/XLSX] {spec.table_path}  sheets={list(sheets.keys())}")
+
+        xl_hlinks = get_excel_hyperlinks(spec.table_path)
+
+        for sheet, df in sheets.items():
+            if df is None or df.shape[1] == 0:
+                print(f"   ↳ sheet='{sheet}'  (empty)  SKIPPED")
                 continue
+            df = df.astype(str)
+            df_norm = collapse_to_first_three(df).copy()
+            if df_norm.shape[1] < 3:
+                while df_norm.shape[1] < 3:
+                    df_norm[f"_pad{df_norm.shape[1]}"] = ""
+                df_norm = df_norm.iloc[:, :3]
+            df_norm.columns = CANON
+            head = df_norm.head(4)
+            out_name = f"{rel_group}_{spec.table_path.stem}_{sheet}_head.csv"
+            head.to_csv(PREVIEW_DIR / out_name, index=False)
+            print(f"   ↳ sheet='{sheet}'  columns={list(df_norm.columns)}  rows_shown={len(head)}")
 
-            files_seen += 1
+            if fetch_urls:
+                urls_text = set(extract_urls_from_df(df))
+                urls_link = set(xl_hlinks.get(sheet, []))
+                urls = sorted(urls_text.union(urls_link))
+                # Filter to http(s) only (ignore local files)
+                urls = [u for u in urls if u.lower().startswith("http")]
+                _download_urls(urls, spec.group_dir, urls_subdir, url_timeout)
 
-    if files_seen == 0:
+    else:
+        df, delim = try_read_csv(spec.table_path)
+        df = df.astype(str)
+        df_norm = collapse_to_first_three(df).copy()
+        if df_norm.shape[1] < 3:
+            while df_norm.shape[1] < 3:
+                df_norm[f"_pad{df_norm.shape[1]}"] = ""
+            df_norm = df_norm.iloc[:, :3]
+        df_norm.columns = CANON
+        head = df_norm.head(4)
+        out_name = f"{rel_group}_{spec.table_path.stem}_head.csv"
+        head.to_csv(PREVIEW_DIR / out_name, index=False)
+        print(f"[CSV] {spec.table_path}\n      delimiter={repr(delim)}  columns={list(df_norm.columns)}  rows_shown={len(head)}")
+
+        if fetch_urls:
+            urls = extract_urls_from_df(df)
+            urls = [u for u in urls if u.lower().startswith("http")]
+            _download_urls(urls, spec.group_dir, urls_subdir, url_timeout)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Preview student tables and optionally fetch embedded URLs.")
+    ap.add_argument("root", help="Root folder containing group subfolders")
+    ap.add_argument("--fetch-urls", action="store_true", help="Fetch any URLs found in tables")
+    ap.add_argument("--urls-subdir", default="urls", help="Per-group subfolder to save fetched URLs (default: urls)")
+    ap.add_argument("--url-timeout", type=int, default=20, help="HTTP timeout seconds per URL (default: 20)")
+    args = ap.parse_args()
+
+    root = Path(args.root).expanduser().resolve()
+    if not root.exists():
+        print(f"[ERROR] Root not found: {root}", file=sys.stderr)
+        sys.exit(2)
+
+    any_found = False
+    for spec in find_tables(root):
+        any_found = True
+        try:
+            preview_and_optionally_fetch(spec, fetch_urls=args.fetch_urls, urls_subdir=args.urls_subdir, url_timeout=args.url_timeout)
+        except Exception as e:
+            print(str(e), file=sys.stderr)
+
+    if not any_found:
         print(f"[INFO] No CSV/XLS workbooks found under {root}")
 
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Preview tables and optionally fetch URLs embedded in CSV/XLS files.")
-    parser.add_argument("root", help="Root directory with cohorts/groups")
-    parser.add_argument("--fetch-urls", action="store_true", help="Fetch and save URLs found in tables")
-    parser.add_argument("--urls-subdir", default="urls", help="Relative folder under each group to save fetched URLs")
-    parser.add_argument("--url-timeout", type=int, default=20, help="HTTP timeout per URL in seconds")
-    args = parser.parse_args()
-    main(Path(args.root).resolve(), fetch_urls=args.fetch_urls, urls_subdir=args.urls_subdir, url_timeout=args.url_timeout)
+    main()
