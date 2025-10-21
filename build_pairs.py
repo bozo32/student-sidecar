@@ -49,6 +49,51 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 
+import time
+import math
+import threading
+
+
+# ----------------- Graph/figure reference tagging -----------------
+GRAPH_TOKENS = [
+    "figure", "fig.", "fig ", "graph", "diagram", "chart",
+    "table", "image", "photo", "schematic", "map", "plot"
+]
+
+def _is_graph_like(quote_from_source: str, quote_from_report: str) -> tuple[bool, str]:
+    """
+    Heuristic to tag rows likely referring to non-textual elements (figures/graphs/tables)
+    rather than quoting running text.
+
+    Rules (any TRUE -> tag as graph_like):
+      A) The source quote is very short (< 40 chars) AND the report quote is at least 3x longer.
+      B) The source quote mentions indicative tokens (figure/fig./graph/chart/table/etc.).
+      C) The source quote is empty/near-empty but the report quote is long (> 80 chars).
+
+    Returns (is_graph_like, reason_string)
+    """
+    qs = (quote_from_source or "").strip()
+    qr = (quote_from_report or "").strip()
+    qs_len = len(qs)
+    qr_len = len(qr)
+
+    # A) length ratio
+    if qs_len < 40 and qr_len > 0 and (qr_len / max(1, qs_len + 1)) >= 3:
+        return True, "short_source_vs_long_report"
+
+    # B) token hits (in the source quote)
+    low = qs.lower()
+    for tok in GRAPH_TOKENS:
+        if tok in low:
+            return True, f"token:{tok}"
+
+    # C) empty-ish source vs long report
+    if qs_len == 0 and qr_len >= 80:
+        return True, "empty_source_long_report"
+
+    return False, ""
+
+
 # ----------------- Excel HYPERLINK stripper -----------------
 
 HYPERLINK_RE = re.compile(r'^\s*=\s*HYPERLINK\s*\(\s*"([^"]*)"\s*,\s*"([^"]*)"\s*\)\s*$', re.I)
@@ -537,6 +582,8 @@ class PairRow:
     ocr_used: Optional[bool] = None
     extract_ok: bool = False
     extract_error: Optional[str] = None
+    graph_like: Optional[bool] = None
+    graph_reason: Optional[str] = None
 
 # Helper function: robust cell fetch for possibly duplicated column labels
 def _cell_str(row: pd.Series, key: str) -> str:
@@ -564,6 +611,7 @@ def _cell_str(row: pd.Series, key: str) -> str:
     return str(v)
 
 def process_one_row(group_dir: Path,
+                    texts_dir: Path,
                     cohort_id: str,
                     group_id: str,
                     table_path: Path,
@@ -577,6 +625,9 @@ def process_one_row(group_dir: Path,
     q_report = _cell_str(row, "quote_from_report")
     file_raw  = _cell_str(row, "file_name")
     q_source  = _cell_str(row, "quote_from_source")
+
+    # Identify likely figure/graph/table references
+    glike, greason = _is_graph_like(q_source, q_report)
 
     # Row id stable key
     row_id = f"{group_id}:{table_path.name}:{sheet_name}:{ridx}"
@@ -627,8 +678,8 @@ def process_one_row(group_dir: Path,
             # Compute sha from source bytes up front to address caching
             byts = resolved.read_bytes()
             sha = sha256_bytes(byts)
-            text_path = TEXT_DIR / f"{sha}.txt"
-            tei_path = TEXT_DIR / f"{sha}.tei.xml"
+            text_path = texts_dir / f"{sha}.txt"
+            tei_path = texts_dir / f"{sha}.tei.xml"
 
             # If either artifact already exists, skip expensive extraction
             if text_path.exists() or tei_path.exists():
@@ -678,10 +729,13 @@ def process_one_row(group_dir: Path,
         ocr_used=ocr_used,
         extract_ok=extract_ok,
         extract_error=extract_err,
+        graph_like=bool(glike),
+        graph_reason=greason,
     )
 
 def build_all_pairs(
     root: Path,
+    texts_dir: Path,
     force_academic_pdf: bool,
     grobid_url: Optional[str],
     prefer_excel: bool = False,
@@ -717,11 +771,13 @@ def build_all_pairs(
             resolved_count = 0
             extract_ok_count = 0
             extract_err_count = 0
+            graphlike_count = 0
 
             # Iterate rows
             for ridx, row in df.iterrows():
                 pr = process_one_row(
                     group_dir=group,
+                    texts_dir=texts_dir,
                     cohort_id=cohort_id,
                     group_id=group_id,
                     table_path=table_path,
@@ -754,6 +810,8 @@ def build_all_pairs(
                     extract_ok_count += 1
                 if _def_nonempty(pr.extract_error):
                     extract_err_count += 1
+                if getattr(pr, "graph_like", False):
+                    graphlike_count += 1
 
             stats_rows.append({
                 "cohort_id": cohort_id,
@@ -771,6 +829,8 @@ def build_all_pairs(
                 # Simple quality ratios
                 "resolved_ratio": (resolved_count / nonempty_fname) if nonempty_fname else 0.0,
                 "extract_success_ratio": (extract_ok_count / max(1, nonempty_any)),
+                "graph_like_count": graphlike_count,
+                "graph_like_ratio": (graphlike_count / max(1, total_rows)),
             })
 
     pairs_df = pd.DataFrame(pairs)
@@ -826,6 +886,7 @@ def main():
     # Build pairs + sources + per-table stats
     pairs_df, sources_df, stats_df = build_all_pairs(
         root=root,
+        texts_dir=text_dir,
         force_academic_pdf=args.force_academic_pdf,
         grobid_url=args.grobid_url,
         prefer_excel=args.prefer_excel,

@@ -1,6 +1,30 @@
-# External dependencies; install with pip or `conda install pandas requests openpyxl "xlrd<2.0" trafilatura`.
+# Core data + IO
 pandas>=1.5
+pyarrow>=12
+
+# File formats used by extract_text.py
 requests>=2.28
 openpyxl>=3.1
 xlrd<2.0
 trafilatura>=1.6
+lxml>=4.9       # HTML parsing backbone
+
+# Parsers / extractors by file type
+python-docx>=1.1.0       # for .docx
+pdfminer.six>=20220524   # PDF text extraction
+pypdf>=4.0               # optional: PDF utilities (splitting/metadata)
+
+# CLI / UX niceties
+rich>=13.3
+tqdm>=4.66
+
+# ranking
+rank-bm25>=0.2.2
+rapidfuzz>=3.9.6
+
+# Optional extras (uncomment as needed)
+# fastparquet>=2023.8.0        # alternative Parquet engine
+# pytesseract>=0.3.10          # OCR bridge (requires the Tesseract binary installed separately)
+# opencv-python-headless>=4.9  # useful if you add OCR pre-processing
+# beautifulsoup4>=4.12         # extra HTML parsing; trafilatura already covers most cases
+# python-dotenv>=1.0           # load settings from a .env file

@@ -1,13 +1,68 @@
+
+### Why this matters
+
+Unchecked citations are a weak link in both education and research. This sidecar workflow turns citation checking into an educational, auditable, data‑rich process: it strengthens the integrity of student work by requiring sound citation practice, reveals how sources were actually used (facilitating assessment and naturalising transparent reporting), and generates aligned text‑evidence pairs suitable for training and benchmarking discipline specific language models. 
+
+This repository serves **two distinct audiences**:
+
+1. **Teachers** who want to make sound citation practice and transparent reporting a natural habit. The sidecar system enables instructors better to understand student engagement with the literature buy guiding and making visible proof of that engagement through steps that are trivial for good students and which block the most common forms of gen‑AI shortcutting.
+
+2. **Developers and researchers** building or testing **natural language inference (NLI)**, citation verification, or retrieval pipelines. The dataset produced links student claims to verified source evidence with full provenance, and includes all source documents plus content‑addressed sidecars so you can evaluate both *extraction/parsing* and *reasoning* robustness.
+
+---
+
+
 # 🧩 student-sidecar
 
-Tools to audit and normalize student “supplemental information” submissions and build a dataset for **citation checking**. The pipeline:
+## 👩‍🏫 For Teachers: Auditing Student Submissions
 
-1) **process_submissions.py** — scan folders, preview tables, (optionally) capture and download URLs found in CSV/XLS.
-2) **extract_text.py** — content-address files (SHA256) and extract text/TEI from PDFs/HTML/DOCX/… (GROBID for academic PDFs).
-3) **build_pairs.py** — normalize messy tables into a clean row-level dataset linking *quote_from_report ↔ source file ↔ quote_from_source*; consolidates URL downloads into the dataset; writes summary diagnostics.
-4) **verify_quotes.py** — attempt to verify that *quote_from_source* actually appears in the referenced source using BM25 + embedding similarity; per‑group JSON reports.
+The approach in this repository enables teachers to review student citation practice by operating on metadata (“sidecars”) produced by those students in the course of their normal engagement with the literature.
+
+The script `process_submissions.py` scans each submission folder, creates previews of the first few rows of each CSV/XLS(X) table, and can **optionally fetch URLs** embedded in tables or Excel hyperlinks. This helps instructors quickly to spot missing sources.
+
+With `build_pairs.py`, the toolchain **identifies misaligned or problematic citations**. It includes a “graph_like” heuristic that flags cases where the quoted material seems to refer to a figure, table, or other non-running-text element, rather than actual text from the source. This is especially useful for highlighting when students cite images or data visualizations instead of quoting or paraphrasing written content and relevant for testing students, and models, extraction and interpretation of non-textual information from documents.
+
+Finally, the verification reports produced by `verify_quotes.py` provide teachers with a detailed summary of citation integrity. These reports indicate which quotes could be matched to the submitted sources, which were missed (and why). These diagnostics can be used as a basis for discussion with students about proper citation practices, integrity, and common pitfalls in academic writing.
+
+## 🧠 For Developers: Data for NLI Training
+
+This toolchain builds **three-layer paired data** connecting (1) a student’s quoted text from their report (`quote_from_report`), (2) the text they claim it came from in the source (`quote_from_source`), and (3) the full original source document from which that passage was drawn. The source is checked to determine whether the quoted portion actually appears there. The resulting dataset can be used to train or evaluate systems for citation verification, fact-checking, and natural language inference (NLI).
+
+The main outputs are:
+- `pairs_raw.parquet`: one row per citation pair.
+- JSON verification reports (from `verify_quotes.py`).
+- Plain-text and TEI sidecars for every unique source file.
+
+Extraction is handled in layers. GROBID is used for structured academic PDFs, OCR is applied only when text can’t be read directly, and lighter extractors handle HTML, DOCX, and similar files. The goal is full coverage with minimal noise.
+
+Because the dataset includes the **original source documents**, it supports not only NLI testing but also evaluation of extraction and parsing from messy, real-world documents. Every step records hashes and provenance, so results are reproducible.
+
+The pipeline:
+
+1) **process_submissions.py**
+   - **Input:** root folder with submission subfolders.
+   - **Does:** reads CSV/XLS(X), prints 4‑row previews, optionally fetches HTTP/HTTPS links discovered in cells or Excel hyperlinks.
+   - **Creates:** `previews/` CSV heads; `<group>/urls/` with downloaded files and a `_manifest.csv`.
+
+2) **extract_text.py**
+   - **Input:** root (or a single group/folder).
+   - **Does:** computes SHA256 of each source; extracts plain text (PyMuPDF/HTML/DOCX/TXT), calls **GROBID** for academic PDFs (TEI), OCR only when needed.
+   - **Creates:** `artifacts/text/<sha>.txt` (+ `<sha>.tei.xml` when TEI exists) and `artifacts/parquet/sources.parquet`.
+   - **Notes:** idempotent (skips already‑extracted SHA sidecars); content‑addressed and reproducible.
+
+3) **build_pairs.py**
+   - **Input:** normalized tables + extracted sidecars (`artifacts/text`) and `sources.parquet`.
+   - **Does:** normalizes columns to `quote_from_report | file_name | quote_from_source`, resolves `file_name` to actual files (fuzzy match, Excel hyperlink handling), consolidates any `<group>/urls/_manifest.csv`, tags **graph_like** candidates.
+   - **Creates:** `artifacts/parquet/pairs_raw.parquet`, `artifacts/parquet/tables_report.{parquet,csv}`, and `artifacts/parquet/urls_manifest.parquet` (if URLs were consolidated).
+
+4) **verify_quotes.py**
+   - **Input:** `pairs_raw.parquet` + sidecars in `artifacts/text/`.
+   - **Does:** verifies that `quote_from_source` appears in the referenced source via **BM25 → SBERT cosine → fuzzy/Jaccard** cascade; handles multi‑sentence windows; skips trivial figure/table strings.
+   - **Creates:** per‑group JSON in `artifacts/verification/` (+ optional flat summary parquet/csv when `--summary` is set).
 
 > Designed to be resilient to messy student data (odd encodings, inconsistent filenames, extra columns, Excel hyperlinks, etc.).
+
+At this point student assessment asks whether the 'quote from source' provided by the student can, indeed, be found in that source. For easily parsable source documents where the relevant information is in body text, this expectation performs very well. The same can not be said for messy documents or supporting information found in non-textual features. At this point I am running the assumption that students will not willfully submit false information in these tables so failures to detect are more likely attributable to shortcomings in these scripts. 
 
 ---
 

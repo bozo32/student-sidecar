@@ -1,0 +1,401 @@
+{
+  "group": "group 8 supplemental information",
+  "success_ratio": 0.7333,
+  "total": 45,
+  "hits": 33,
+  "misses": 12,
+  "by_source": [
+    {
+      "source_filename": "ARK Rewilding Nederland, & Natuurmonumenten, (2024).htm",
+      "hits": 2,
+      "misses": 1,
+      "misses_detail": [
+        {
+          "row_index": 8,
+          "claimed_quote": "Table shows citizens approximately Meers (600) and Kotem approx (1000)",
+          "candidate": "Laatste berichten Congres Natuur-inbouw met uitreiking Award voor Natuurinclusief Bouwen & Ontwerpen 15-okt-2025 Natuur in het licht - waarom het donker belangrijk is 15-okt-2025 Natuurjournaal 15 oktober 2025 15-okt-2025 Nieuwe bosranden op Havezate Den Alerdinck zijn boost voor biodiversiteit 14-okt-2025 Wat gebeurt er als natuur plaats moet maken voor ruimtelijke ontwikkelingen? 14-okt-2025 Kom in actie voor de torenvalk 14-okt-2025 Natuurjournaal 14 oktober 2025 14-okt-2025 eDNA onthult verborgen reizen van trekvissen in de Westerwoldsche Aa 13-okt-2025 Europese vlinders steeds meer bedreigd door verlies aan leefgebied en klimaatverandering 13-okt-2025 Natuurjournaal 13 oktober 2025 13-okt-2025 Zie ook Grindbanken bij Meers tot leven gewekt 23-mei-2018 Onderwaternatuur: van druk naar herstel 4-jun-2025 Grensmaas nu veiliger en natuurlijker 15-okt-2017 Effecten Grensmaasproject goed merkbaar 18-feb-2016 Natuur beleven vanuit de luie stoel 10-mrt-2013 Disclaimer Colofon Sitemap Cookies © 2025 NatureToday - All rights reserved Close suggested results",
+          "span": [
+            29,
+            29
+          ],
+          "cosine": 0.18214979767799377,
+          "bm25": 8.738326126909318,
+          "fuzzy": 37,
+          "jaccard5": 0.003243243243243243,
+          "alt_idx": 18,
+          "alt_cosine": 0.11372964084148407,
+          "note": "below thresholds"
+        }
+      ]
+    },
+    {
+      "source_filename": "Berg et al., 2020.pdf",
+      "hits": 1,
+      "misses": 0,
+      "misses_detail": []
+    },
+    {
+      "source_filename": "Bijker et al., (2012).pdf",
+      "hits": 1,
+      "misses": 1,
+      "misses_detail": [
+        {
+          "row_index": 13,
+          "claimed_quote": "The Room for the River concept is related to river restoration or rehabilitation, sustainable river management, river flood management and river widening.",
+          "candidate": "The first group, residential motives, refers to the quality of the housing and residential environment.",
+          "span": [
+            61,
+            61
+          ],
+          "cosine": 0.3046044111251831,
+          "bm25": 14.475567794390377,
+          "fuzzy": 45,
+          "jaccard5": 0.014018691588785047,
+          "alt_idx": 2,
+          "alt_cosine": 0.2509740889072418,
+          "note": "below thresholds"
+        }
+      ]
+    },
+    {
+      "source_filename": "Botzen et al., 2009.pdf",
+      "hits": 1,
+      "misses": 0,
+      "misses_detail": []
+    },
+    {
+      "source_filename": "Burningham et al., (2007) .pdf",
+      "hits": 1,
+      "misses": 0,
+      "misses_detail": []
+    },
+    {
+      "source_filename": "CBS (2023).htm",
+      "hits": 0,
+      "misses": 1,
+      "misses_detail": [
+        {
+          "row_index": 3,
+          "claimed_quote": "% of adults of total population netherlands is given on the site",
+          "candidate": "Het percentage jongeren verschilt sterk per gemeente.",
+          "span": [
+            5,
+            5
+          ],
+          "cosine": 0.402022123336792,
+          "bm25": 3.02725244060385,
+          "fuzzy": 38,
+          "jaccard5": 0.0,
+          "alt_idx": 14,
+          "alt_cosine": 0.3217144012451172,
+          "note": "below thresholds"
+        }
+      ]
+    },
+    {
+      "source_filename": "Cohen-Shachman et al., 2016.pdf",
+      "hits": 1,
+      "misses": 0,
+      "misses_detail": []
+    },
+    {
+      "source_filename": "Cross., (2015).pdf",
+      "hits": 1,
+      "misses": 0,
+      "misses_detail": []
+    },
+    {
+      "source_filename": "Czúcz et al., 2018.htm",
+      "hits": 0,
+      "misses": 5,
+      "misses_detail": [
+        {
+          "row_index": 15,
+          "claimed_quote": "Thus, in CICES, provisioning services, are the material and energetic outputs from ecosystems from which goods and products are derived. The regulating services category includes all the ways in which ecosystems can mediate the environment in which people live or depend on in some way, and benefit from them in terms of their health or security, for example. Finally, the cultural services category identified all the non-material characteristics of ecosystems that contribute to, or are important for people’s mental or intellectual well-being. In contrast to the MA, however, so-called ‘supporting services’ are not included in this classification, since the focus was on how ecosystem outputs more directly contribute to human well-being; the concept of ‘final ecosystem services’",
+          "candidate": "Where concepts meet the real world: A systematic review of ecosystem service indicators and their classification using CICES - ScienceDirect JavaScript is disabled on your browser. Please enable JavaScript to use all the features on this page. Skip to main content Skip to article View PDF Download full issue Search ScienceDirect Ecosystem Services Volume 29, Part A , February 2018 , Pages 145-157 Where concepts meet the real world: A systematic review of ecosystem service indicators and their classification using CICES Author links open overlay panel Bálint Czúcz a b , Ildikó Arany a c , Marion Potschin-Young d , Krisztina Bereczki a , Miklós Kertész a , Márton Kiss a e , Réka Aszalós a , Roy Haines-Young d Show more Add to Mendeley Share Cite https://doi.org/10.1016/j.ecoser.2017.11.018 Get rights and content Under a Creative Commons license Open access Highlights • We compared the ES definitions used in published papers to CICES class definitions. • Cultural and regulating ES are more frequently studied than provisioning ES. • 20% of the indicators were monetized, typically cultural and provisioning ES. • We call for better documentation in ES studies. • Concept matching is a promising new approach for ES systematic reviews.",
+          "span": [
+            0,
+            2
+          ],
+          "cosine": 0.7053453922271729,
+          "bm25": 41.35833475175193,
+          "fuzzy": 41,
+          "jaccard5": 0.0726294552790854,
+          "alt_idx": 26,
+          "alt_cosine": 0.6705250144004822,
+          "note": "below thresholds"
+        },
+        {
+          "row_index": 16,
+          "claimed_quote": "In contrast to the MA, however, so-called ‘supporting services’ are not included in this classification, since the focus was on how ecosystem outputs more directly contribute to human well-being; the concept of ‘final ecosystem services’",
+          "candidate": "Previous article in issue Next article in issue Keywords Ecosystem service classification Ecosystem service mapping Ecosystem service assessment Concept matching MAES CICES Recommended articles © 2018 The Authors.",
+          "span": [
+            14,
+            14
+          ],
+          "cosine": 0.6513597965240479,
+          "bm25": 9.716686507963574,
+          "fuzzy": 44,
+          "jaccard5": 0.08959537572254335,
+          "alt_idx": 3,
+          "alt_cosine": 0.6261169910430908,
+          "note": "below thresholds"
+        },
+        {
+          "row_index": 17,
+          "claimed_quote": "The regulating services category includes all the ways in which ecosystems can mediate the environment in which people live or depend on in some way, and benefit from them in terms of their health or security, for example.",
+          "candidate": "Few regulating services, on the other hand, were monetised (including ones, like global climate regulation , for which appropriate techniques are relatively easily available).",
+          "span": [
+            11,
+            11
+          ],
+          "cosine": 0.5878732800483704,
+          "bm25": 13.54437177844688,
+          "fuzzy": 50,
+          "jaccard5": 0.07736389684813753,
+          "alt_idx": 4,
+          "alt_cosine": 0.5488384962081909,
+          "note": "below thresholds"
+        },
+        {
+          "row_index": 18,
+          "claimed_quote": "Thus, in CICES, provisioning services are the material and energetic outputs from ecosystems from which goods and products are derived.",
+          "candidate": "Skip to main content Skip to article View PDF Download full issue Search ScienceDirect Ecosystem Services Volume 29, Part A , February 2018 , Pages 145-157 Where concepts meet the real world: A systematic review of ecosystem service indicators and their classification using CICES Author links open overlay panel Bálint Czúcz a b , Ildikó Arany a c , Marion Potschin-Young d , Krisztina Bereczki a , Miklós Kertész a , Márton Kiss a e , Réka Aszalós a , Roy Haines-Young d Show more Add to Mendeley Share Cite https://doi.org/10.1016/j.ecoser.2017.11.018 Get rights and content Under a Creative Commons license Open access Highlights • We compared the ES definitions used in published papers to CICES class definitions. • Cultural and regulating ES are more frequently studied than provisioning ES. • 20% of the indicators were monetized, typically cultural and provisioning ES. • We call for better documentation in ES studies. • Concept matching is a promising new approach for ES systematic reviews.",
+          "span": [
+            2,
+            2
+          ],
+          "cosine": 0.5108683109283447,
+          "bm25": 12.323440737987212,
+          "fuzzy": 43,
+          "jaccard5": 0.03785488958990536,
+          "alt_idx": 10,
+          "alt_cosine": 0.4635152220726013,
+          "note": "below thresholds"
+        },
+        {
+          "row_index": 19,
+          "claimed_quote": "Finally, the cultural services category identified all the non-material characteristics of ecosystems that contribute to, or are important for people’s mental or intellectual well-being.",
+          "candidate": "Skip to main content Skip to article View PDF Download full issue Search ScienceDirect Ecosystem Services Volume 29, Part A , February 2018 , Pages 145-157 Where concepts meet the real world: A systematic review of ecosystem service indicators and their classification using CICES Author links open overlay panel Bálint Czúcz a b , Ildikó Arany a c , Marion Potschin-Young d , Krisztina Bereczki a , Miklós Kertész a , Márton Kiss a e , Réka Aszalós a , Roy Haines-Young d Show more Add to Mendeley Share Cite https://doi.org/10.1016/j.ecoser.2017.11.018 Get rights and content Under a Creative Commons license Open access Highlights • We compared the ES definitions used in published papers to CICES class definitions. • Cultural and regulating ES are more frequently studied than provisioning ES. • 20% of the indicators were monetized, typically cultural and provisioning ES. • We call for better documentation in ES studies. • Concept matching is a promising new approach for ES systematic reviews.",
+          "span": [
+            2,
+            2
+          ],
+          "cosine": 0.565815806388855,
+          "bm25": 9.917808535532785,
+          "fuzzy": 43,
+          "jaccard5": 0.0265748031496063,
+          "alt_idx": 15,
+          "alt_cosine": 0.5265517234802246,
+          "note": "below thresholds"
+        }
+      ]
+    },
+    {
+      "source_filename": "De Nardi, 2010.pdf",
+      "hits": 1,
+      "misses": 0,
+      "misses_detail": []
+    },
+    {
+      "source_filename": "Dekker et al., 2025.pdf",
+      "hits": 1,
+      "misses": 1,
+      "misses_detail": [
+        {
+          "row_index": 2,
+          "claimed_quote": "Die golf van water rolt dagen later richting de Betuwe, Bommelerwaard en het land van Maas en Waal. Ruim 250.000 bewoners en 1 miljoen dieren moeten het gebied op stel en sprong verlaten.",
+          "candidate": "The authors disclosed receipt of the following financial support for the research, authorship, and/or publication of this article: This work was supported by ZonMw, 'De maatschappelijke impact van COVID-19' (The social impact of COVID-19) (grant number 10430032010034). The authors declared no potential conflicts of interest with respect to the research, authorship and/or publication of this article.",
+          "span": [
+            204,
+            205
+          ],
+          "cosine": 0.14255201816558838,
+          "bm25": 11.425229934812739,
+          "fuzzy": 37,
+          "jaccard5": 0.002053388090349076,
+          "alt_idx": 0,
+          "alt_cosine": 0.12481633573770523,
+          "note": "below thresholds"
+        }
+      ]
+    },
+    {
+      "source_filename": "European Commission, 2024.pdf",
+      "hits": 1,
+      "misses": 0,
+      "misses_detail": []
+    },
+    {
+      "source_filename": "Guilfoos et al., 2023.pdf",
+      "hits": 1,
+      "misses": 0,
+      "misses_detail": []
+    },
+    {
+      "source_filename": "Hashim et al., 2022.pdf",
+      "hits": 1,
+      "misses": 0,
+      "misses_detail": []
+    },
+    {
+      "source_filename": "Hempel et al., 2020.pdf",
+      "hits": 2,
+      "misses": 0,
+      "misses_detail": []
+    },
+    {
+      "source_filename": "IMF, 2024.pdf",
+      "hits": 1,
+      "misses": 0,
+      "misses_detail": []
+    },
+    {
+      "source_filename": "Martikainen et al., (2007).pdf",
+      "hits": 1,
+      "misses": 0,
+      "misses_detail": []
+    },
+    {
+      "source_filename": "McGinlay et al., 2023.pdf",
+      "hits": 3,
+      "misses": 0,
+      "misses_detail": []
+    },
+    {
+      "source_filename": "Palinkas et al., (2015).pdf",
+      "hits": 1,
+      "misses": 0,
+      "misses_detail": []
+    },
+    {
+      "source_filename": "Paniello-Castillo et al., 2025.pdf",
+      "hits": 1,
+      "misses": 0,
+      "misses_detail": []
+    },
+    {
+      "source_filename": "Park et al., (2018).pdf",
+      "hits": 1,
+      "misses": 1,
+      "misses_detail": [
+        {
+          "row_index": 15,
+          "claimed_quote": "The conditional standards for the main project objectives (goals 1-3 of Table 2) are stated clearly by the government: a maximum flood recurrence of 1/250,3 minimally 1000 ha of newnature, and minimally 35 million tons of extracted gravel",
+          "candidate": "The attitudinal data are from a survey question that asked: \"Using a scale of 1 (Extremely Unimportant) to 5 (Extremely Important), please mark the number that best indicates how important you think each of the following items is for maintaining and improving the future quality of life in (town), VT.\" Fifteen development and preservation items were listed.",
+          "span": [
+            203,
+            203
+          ],
+          "cosine": 0.3508267402648926,
+          "bm25": 21.653211274122487,
+          "fuzzy": 40,
+          "jaccard5": 0.01855287569573284,
+          "alt_idx": 14,
+          "alt_cosine": 0.30256402492523193,
+          "note": "below thresholds"
+        }
+      ]
+    },
+    {
+      "source_filename": "Pforr & Schröder, 2016.pdf",
+      "hits": 1,
+      "misses": 0,
+      "misses_detail": []
+    },
+    {
+      "source_filename": "Seidl & Stauffacher, (2013).pdf",
+      "hits": 1,
+      "misses": 0,
+      "misses_detail": []
+    },
+    {
+      "source_filename": "Stancu et al, (2020).pdf",
+      "hits": 0,
+      "misses": 1,
+      "misses_detail": [
+        {
+          "row_index": 2,
+          "claimed_quote": "Table 3",
+          "candidate": "The correlation coefficient between variables, the mean and standard deviation for the total sample are presented in Table 4.",
+          "span": [
+            202,
+            202
+          ],
+          "cosine": 0.3258577287197113,
+          "bm25": 7.448430738320918,
+          "fuzzy": 85,
+          "jaccard5": 0.01680672268907563,
+          "alt_idx": 12,
+          "alt_cosine": 0.3146018981933594,
+          "note": "below thresholds"
+        }
+      ]
+    },
+    {
+      "source_filename": "Thiemann et al., 2022.pdf",
+      "hits": 1,
+      "misses": 0,
+      "misses_detail": []
+    },
+    {
+      "source_filename": "Thissen & Droogleever Fortuijn (2020).pdf",
+      "hits": 1,
+      "misses": 1,
+      "misses_detail": [
+        {
+          "row_index": 5,
+          "claimed_quote": "Table 3, page 7",
+          "candidate": "Table 1 describes some key figures for the original two datasets.",
+          "span": [
+            175,
+            175
+          ],
+          "cosine": 0.408369243144989,
+          "bm25": 10.134319083220289,
+          "fuzzy": 64,
+          "jaccard5": 0.02857142857142857,
+          "alt_idx": 5,
+          "alt_cosine": 0.37252527475357056,
+          "note": "below thresholds"
+        }
+      ]
+    },
+    {
+      "source_filename": "Torunczyk-Ruiz et al, 2020.pdf",
+      "hits": 1,
+      "misses": 0,
+      "misses_detail": []
+    },
+    {
+      "source_filename": "van den Born et al., (2019).pdf",
+      "hits": 1,
+      "misses": 0,
+      "misses_detail": []
+    },
+    {
+      "source_filename": "Van Stokkom et al., 2005.pdf",
+      "hits": 2,
+      "misses": 0,
+      "misses_detail": []
+    },
+    {
+      "source_filename": "Verbaan, 2025.pdf",
+      "hits": 1,
+      "misses": 0,
+      "misses_detail": []
+    },
+    {
+      "source_filename": "Westling et al., (2014).pdf",
+      "hits": 1,
+      "misses": 0,
+      "misses_detail": []
+    }
+  ],
+  "params": {
+    "encoder": "all-MiniLM-L6-v2",
+    "bm25_topk": 20,
+    "cos_thresh": 0.82,
+    "fuzzy_thresh": 85
+  }
+}
