@@ -73,6 +73,7 @@ log = logging.getLogger(__name__)
 GROBID_LIMITER = None        # set to RateLimiter instance when --grobid-rps > 0
 GROBID_MAX_RETRIES = 3
 GROBID_TIMEOUT = 120
+OCR_SEMAPHORE = None        # set to threading.Semaphore in __main__ to cap concurrent OCR
 
 import threading
 
@@ -186,7 +187,7 @@ def _should_ocr(text: Optional[str], path: Path, allow_long_ocr: bool = False) -
             if n_pages > 40 and not allow_long_ocr:
                 return False
             # Only OCR if text_len == 0
-            if (text is not None) and (len(text) > 0):
+            if text and len(text.strip()) >= 200:
                 return False
             # Check first up to 3 pages for any text
             max_pages_to_check = min(3, n_pages)
@@ -207,13 +208,25 @@ def _available(cmd: str) -> bool:
 
 
 def _ocr_text_sidecar(path: Path, timeout: int = 300) -> Optional[str]:
-    """
-    Use ocrmypdf to produce a sidecar text file (no PDF rewrite).
-      ocrmypdf --skip-text --sidecar out.txt in.pdf out.pdf
-    We still must produce an output PDF argument; use a temporary file and ignore it.
+    """Run OCR via ocrmypdf and return extracted text (sidecar only).
+
+    We use `ocrmypdf --skip-text --sidecar out.txt in.pdf out.pdf`.
+    If OCR_SEMAPHORE is configured, it gates concurrent OCR jobs.
     """
     if not _available("ocrmypdf"):
         return None
+
+    sema = OCR_SEMAPHORE
+    if sema is None:
+        return _ocr_text_sidecar_impl(path, timeout=timeout)
+
+    with sema:
+        return _ocr_text_sidecar_impl(path, timeout=timeout)
+
+
+# Implementation for _ocr_text_sidecar (semaphore wrapper calls this).
+def _ocr_text_sidecar_impl(path: Path, timeout: int = 300) -> Optional[str]:
+    """Implementation for _ocr_text_sidecar (semaphore wrapper calls this)."""
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
         out_pdf = td / "out.pdf"
@@ -242,9 +255,11 @@ def _ocr_text_sidecar(path: Path, timeout: int = 300) -> Optional[str]:
     return None
 
 
+
+
 # ---------------------- GROBID ----------------------
 
-def _grobid_fulltext_tei(path: Path, grobid_url: str = "http://localhost:8070", timeout: Optional[int] = None) -> Optional[str]:
+def _grobid_fulltext_tei(path: Path, grobid_url: str = "http://localhost:8070", timeout: Optional[int] = None, metrics: Optional[dict] = None) -> Optional[str]:
     """
     Call a local GROBID service to get TEI XML for the PDF.
     - Respects a global RateLimiter (GROBID_LIMITER)
@@ -253,11 +268,17 @@ def _grobid_fulltext_tei(path: Path, grobid_url: str = "http://localhost:8070", 
     """
     url = f"{grobid_url.rstrip('/')}/api/processFulltextDocument"
     data = {
-        "consolidateHeader": "1",
-        "consolidateCitations": "1",
+        "consolidateHeader": "0",
+        "consolidateCitations": "0",
     }
     max_retries = int(GROBID_MAX_RETRIES)
     eff_timeout = int(timeout if timeout is not None else GROBID_TIMEOUT)
+
+    m = metrics if isinstance(metrics, dict) else None
+    grobid_request_s = 0.0
+    grobid_retry_sleep_s = 0.0
+    grobid_attempts = 0
+    grobid_last_status = None
 
     for attempt in range(max_retries + 1):
         # client-side rate limit
@@ -268,9 +289,14 @@ def _grobid_fulltext_tei(path: Path, grobid_url: str = "http://localhost:8070", 
                 pass
 
         try:
+            t_req0 = time.time()
             with path.open("rb") as fh:
                 files = {"input": (path.name, fh, "application/pdf")}
                 r = requests.post(url, files=files, data=data, timeout=eff_timeout)
+            t_req1 = time.time()
+            grobid_request_s += (t_req1 - t_req0)
+            grobid_attempts += 1
+            grobid_last_status = r.status_code
             # Handle rate-limit / server overload explicitly
             if r.status_code in (429, 503, 502, 500):
                 # backoff with jitter
@@ -278,38 +304,81 @@ def _grobid_fulltext_tei(path: Path, grobid_url: str = "http://localhost:8070", 
                     sleep_s = min(30.0, (2 ** attempt)) + random.random()
                     log.debug(f"GROBID {r.status_code} on {path.name}; retrying in {sleep_s:.2f}s (attempt {attempt+1}/{max_retries})")
                     time.sleep(sleep_s)
+                    grobid_retry_sleep_s += sleep_s
                     continue
                 else:
                     log.debug(f"GROBID gave status {r.status_code} after retries for {path.name}")
+                    if m is not None:
+                        m["grobid_request_s"] = float(grobid_request_s)
+                        m["grobid_retry_sleep_s"] = float(grobid_retry_sleep_s)
+                        m["grobid_attempts"] = int(grobid_attempts)
+                        m["grobid_last_status"] = grobid_last_status
+                        m["grobid_total_s"] = float(grobid_request_s + grobid_retry_sleep_s)
                     return None
 
             r.raise_for_status()
             tei = r.text
             if tei and ("<TEI" in tei or "<tei" in tei or tei.lstrip().startswith("<")):
+                if m is not None:
+                    m["grobid_request_s"] = float(grobid_request_s)
+                    m["grobid_retry_sleep_s"] = float(grobid_retry_sleep_s)
+                    m["grobid_attempts"] = int(grobid_attempts)
+                    m["grobid_last_status"] = grobid_last_status
+                    m["grobid_total_s"] = float(grobid_request_s + grobid_retry_sleep_s)
                 return tei
             # Non-TEI content: no retry unless we think it's a transient HTTP error (already handled)
+            if m is not None:
+                m["grobid_request_s"] = float(grobid_request_s)
+                m["grobid_retry_sleep_s"] = float(grobid_retry_sleep_s)
+                m["grobid_attempts"] = int(grobid_attempts)
+                m["grobid_last_status"] = grobid_last_status
+                m["grobid_total_s"] = float(grobid_request_s + grobid_retry_sleep_s)
             return None
 
         except requests.Timeout:
+            grobid_attempts += 1
+            grobid_last_status = "timeout"
             if attempt < max_retries:
                 sleep_s = min(30.0, (2 ** attempt)) + random.random()
                 log.debug(f"GROBID timeout on {path.name}; retrying in {sleep_s:.2f}s (attempt {attempt+1}/{max_retries})")
                 time.sleep(sleep_s)
+                grobid_retry_sleep_s += sleep_s
                 continue
             else:
                 log.debug(f"GROBID timeout after retries on {path.name}")
+                if m is not None:
+                    m["grobid_request_s"] = float(grobid_request_s)
+                    m["grobid_retry_sleep_s"] = float(grobid_retry_sleep_s)
+                    m["grobid_attempts"] = int(grobid_attempts)
+                    m["grobid_last_status"] = grobid_last_status
+                    m["grobid_total_s"] = float(grobid_request_s + grobid_retry_sleep_s)
                 return None
         except Exception as e:
+            grobid_attempts += 1
+            grobid_last_status = f"error:{type(e).__name__}"
             # Only retry for network-ish errors; otherwise, bail
             if attempt < max_retries:
                 sleep_s = min(15.0, 0.5 * (2 ** attempt)) + random.random()
                 log.debug(f"GROBID error on {path.name}: {e}; retrying in {sleep_s:.2f}s (attempt {attempt+1}/{max_retries})")
                 time.sleep(sleep_s)
+                grobid_retry_sleep_s += sleep_s
                 continue
             else:
                 log.debug(f"GROBID error after retries on {path.name}: {e}")
+                if m is not None:
+                    m["grobid_request_s"] = float(grobid_request_s)
+                    m["grobid_retry_sleep_s"] = float(grobid_retry_sleep_s)
+                    m["grobid_attempts"] = int(grobid_attempts)
+                    m["grobid_last_status"] = grobid_last_status
+                    m["grobid_total_s"] = float(grobid_request_s + grobid_retry_sleep_s)
                 return None
 
+    if m is not None:
+        m["grobid_request_s"] = float(grobid_request_s)
+        m["grobid_retry_sleep_s"] = float(grobid_retry_sleep_s)
+        m["grobid_attempts"] = int(grobid_attempts)
+        m["grobid_last_status"] = grobid_last_status
+        m["grobid_total_s"] = float(grobid_request_s + grobid_retry_sleep_s)
     return None
 
 
@@ -393,10 +462,11 @@ def extract_any(path: Path,
         tried = []
 
         def try_grobid() -> Optional[str]:
-            t0 = time.time()
-            tei = _grobid_fulltext_tei(path, grobid_url=grobid_url, timeout=GROBID_TIMEOUT)
-            t1 = time.time()
-            timings["grobid"] = t1 - t0
+            grobid_metrics: dict = {}
+            tei = _grobid_fulltext_tei(path, grobid_url=grobid_url, timeout=GROBID_TIMEOUT, metrics=grobid_metrics)
+            # Copy grobid metrics into timings with explicit keys
+            for k, v in grobid_metrics.items():
+                timings[k] = v
             nonlocal tei_xml
             if tei:
                 tei_xml = tei
@@ -407,7 +477,7 @@ def extract_any(path: Path,
             t0 = time.time()
             res = _pdf_text_with_pymupdf(path)
             t1 = time.time()
-            timings["pymupdf"] = t1 - t0
+            timings["pymupdf_s"] = t1 - t0
             return res
 
         def try_pdfminer() -> Optional[str]:
@@ -421,7 +491,7 @@ def extract_any(path: Path,
             t0 = time.time()
             res = _ocr_text_sidecar(path)
             t1 = time.time()
-            timings["ocr"] = t1 - t0
+            timings["ocr_s"] = t1 - t0
             return res
 
         if force_academic_pdf:
@@ -465,7 +535,6 @@ def extract_any(path: Path,
                     tei_xml = tei
                     tool = (tool + "+grobid") if tool else "grobid"
 
-        timings["total"] = sum(timings.get(k, 0) for k in timings)
         return {
             "sha256": sha,
             "text": text,
@@ -480,8 +549,7 @@ def extract_any(path: Path,
         t0 = time.time()
         text = _docx_text(path)
         t1 = time.time()
-        timings["docx"] = t1 - t0
-        timings["total"] = t1 - t0
+        timings["docx_s"] = t1 - t0
         return {
             "sha256": sha,
             "text": text,
@@ -496,8 +564,7 @@ def extract_any(path: Path,
         t0 = time.time()
         text = _html_text(path)
         t1 = time.time()
-        timings["html"] = t1 - t0
-        timings["total"] = t1 - t0
+        timings["html_s"] = t1 - t0
         return {
             "sha256": sha,
             "text": text,
@@ -512,8 +579,7 @@ def extract_any(path: Path,
         t0 = time.time()
         text = _txt_text(path)
         t1 = time.time()
-        timings["txt"] = t1 - t0
-        timings["total"] = t1 - t0
+        timings["txt_s"] = t1 - t0
         return {
             "sha256": sha,
             "text": text,
@@ -525,7 +591,6 @@ def extract_any(path: Path,
 
     # Fallback: unknown binary → no text
 
-    timings["total"] = 0
     return {
         "sha256": sha,
         "text": None,
@@ -535,6 +600,36 @@ def extract_any(path: Path,
         "timings": timings,
     }
 
+
+# ---------------------- multiprocessing-safe worker ----------------------
+# NOTE: On macOS the default multiprocessing start method is `spawn`, which requires
+# worker callables to be importable at module top-level (picklable). Do not move this
+# inside __main__.
+
+def extract_other_worker(fpath_str: str,
+                         allow_long_ocr: bool,
+                         grobid_url: str) -> tuple[str, Optional[Dict[str, object]], Optional[Exception]]:
+    """ProcessPool worker for non-PDF files (and PDFs when we intentionally avoid GROBID).
+
+    Returns: (fpath_str, out_dict_or_none, err_or_none)
+    """
+    timing_log: dict = {}
+    try:
+        t0 = time.time()
+        out = extract_any(
+            Path(fpath_str),
+            prefer_ocr=False,
+            force_academic_pdf=False,
+            grobid_url=grobid_url,
+            allow_long_ocr=bool(allow_long_ocr),
+            timing_log=timing_log,
+        )
+        t1 = time.time()
+        out.setdefault("timings", {})
+        out["timings"]["wall_elapsed"] = t1 - t0
+        return (fpath_str, out, None)
+    except Exception as e:
+        return (fpath_str, None, e)
 
 # ---------------------- CLI runner ----------------------
 if __name__ == "__main__":
@@ -549,6 +644,9 @@ if __name__ == "__main__":
     parser.add_argument("root", type=str, help="Root directory to walk (group folders under here).")
     parser.add_argument("--texts-dir", type=str, default="artifacts/text", help="Directory to write .txt and .tei.xml artifacts.")
     parser.add_argument("--parquet-dir", type=str, default="artifacts/parquet", help="Directory to write sources.parquet.")
+    parser.add_argument("--out-root", type=str, default=None, help="Cohort output root; when set, parquet goes to <out-root>/parquet.")
+    parser.add_argument("--store-dir", type=str, default=None, help="Global store root; when set, artifacts go to <store-dir>/text and <store-dir>/meta.")
+    parser.add_argument("--cohort-id", type=str, default=None, help="Cohort identifier recorded in sources.parquet (default derives from out-root name).")
     parser.add_argument("--grobid-url", type=str, default="http://localhost:8070", help="Base URL of the GROBID service.")
     parser.add_argument("--force-academic-pdf", action="store_true", help="Try GROBID first for PDFs (assume academic PDFs).")
     parser.add_argument("--prefer-ocr", action="store_true", help="If PDF text looks sparse, allow OCR sidecar and prefer it when longer.")
@@ -559,16 +657,51 @@ if __name__ == "__main__":
     parser.add_argument("--verify-report", type=str, default=None, help="Optional path to write a JSON verification report.")
     parser.add_argument("--workers", type=int, default=1, help="Number of concurrent extraction workers (for GROBID/threaded requests).")
     parser.add_argument("--allow-long-ocr", action="store_true", help="Allow OCR on PDFs with more than 40 pages.")
-    parser.add_argument("--grobid-rps", type=float, default=0.0, help="Client-side throttle for GROBID: max requests per second (0 = no throttle).")
+    parser.add_argument("--grobid-rps", type=float, default=0.5, help="Client-side throttle for GROBID: max requests per second (0 = no throttle).")
     parser.add_argument("--grobid-max-retries", type=int, default=3, help="Max retries for GROBID 429/5xx/timeouts.")
-    parser.add_argument("--grobid-timeout", type=int, default=120, help="Per-request timeout (seconds) for GROBID.")
+    parser.add_argument("--grobid-timeout", type=int, default=60, help="Per-request timeout (seconds) for GROBID.")
     args = parser.parse_args()
 
     root = Path(args.root).expanduser().resolve()
-    texts_dir = Path(args.texts_dir).expanduser().resolve()
-    parquet_dir = Path(args.parquet_dir).expanduser().resolve()
+
+    # Cohort-scoped output root (parquet/verification/etc.)
+    out_root = Path(args.out_root).expanduser().resolve() if args.out_root else None
+    if out_root is not None:
+        parquet_dir = out_root / "parquet"
+    else:
+        parquet_dir = Path(args.parquet_dir).expanduser().resolve()
     parquet_dir.mkdir(parents=True, exist_ok=True)
+
+    # Global, content-addressed store for extracted artifacts (text/tei)
+    store_dir = Path(args.store_dir).expanduser().resolve() if args.store_dir else None
+    if store_dir is not None:
+        texts_dir = store_dir / "text"
+        meta_dir = store_dir / "meta"
+    else:
+        texts_dir = Path(args.texts_dir).expanduser().resolve()
+        meta_dir = None
+
     texts_dir.mkdir(parents=True, exist_ok=True)
+    if meta_dir is not None:
+        meta_dir.mkdir(parents=True, exist_ok=True)
+
+    # Cohort identifier (used in sources.parquet)
+    if args.cohort_id:
+        cohort_id = str(args.cohort_id)
+    elif out_root is not None:
+        cohort_id = out_root.name
+    else:
+        from datetime import datetime, timezone
+        cohort_id = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S%z")
+
+    # Allow passing a single file path as `root`.
+    root_is_file = root.is_file()
+    if root_is_file:
+        single_file = root
+        root_dir_for_group = root.parent
+    else:
+        single_file = None
+        root_dir_for_group = root
 
     # Initialize GROBID throttling/retry globals from CLI
     GROBID_MAX_RETRIES = int(args.grobid_max_retries)
@@ -643,7 +776,7 @@ if __name__ == "__main__":
                     path_ok[sp] = path_ok.get(sp, False) or ok
 
         def grp(p: str) -> str:
-            return group_from_path(Path(p), root)
+            return group_from_path(Path(p), root_dir_for_group)
 
         groups = {}
         for p in expected_paths:
@@ -697,28 +830,52 @@ if __name__ == "__main__":
         tei_xml = out.get("tei_xml")
         if tei_xml:
             tei_path.write_text(tei_xml, encoding="utf-8", errors="ignore")
-
+        # Optional: write per-source provenance metadata into the global store
+        if meta_dir is not None:
+            try:
+                meta_path = meta_dir / f"{sha}.json"
+                payload = {
+                    "sha256": sha,
+                    "first_seen_path": str(src_path),
+                    "extract_tool": out.get("extract_tool"),
+                    "ocr_used": bool(out.get("ocr_used")),
+                    "timings": out.get("timings", {}),
+                    "grobid_url": args.grobid_url if hasattr(args, "grobid_url") else None,
+                }
+                meta_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
+                                    encoding="utf-8", errors="ignore")
+            except Exception:
+                pass
     # For verification we collect all eligible source paths, even when not extracting.
     all_expected_paths: set[str] = set()
-    files_to_extract = []
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
-        for fname in filenames:
-            if fname.startswith("."):
-                continue
-            fpath = Path(dirpath) / fname
+    files_to_extract: list[Path] = []
+
+    if root_is_file:
+        fpath = single_file
+        if fpath is not None and fpath.exists() and not fpath.name.startswith("."):
             if fpath.suffix.lower() in wanted_exts:
                 all_expected_paths.add(str(fpath))
-            if fpath.suffix.lower() not in wanted_exts:
-                continue
-            if args.verify_only:
-                continue
-            files_to_extract.append(fpath)
+                if not args.verify_only:
+                    files_to_extract.append(fpath)
+    else:
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            for fname in filenames:
+                if fname.startswith("."):
+                    continue
+                fpath = Path(dirpath) / fname
+                if fpath.suffix.lower() in wanted_exts:
+                    all_expected_paths.add(str(fpath))
+                if fpath.suffix.lower() not in wanted_exts:
+                    continue
+                if args.verify_only:
+                    continue
+                files_to_extract.append(fpath)
 
     # Concurrency
     max_workers = max(1, args.workers)
     max_ocr_workers = 2
-    ocr_semaphore = threading.Semaphore(max_ocr_workers)
+    OCR_SEMAPHORE = threading.Semaphore(max_ocr_workers)
     # Partition files by extension for GROBID (PDFs) vs local (others)
     pdf_files = [p for p in files_to_extract if p.suffix.lower() == ".pdf"]
     other_files = [p for p in files_to_extract if p.suffix.lower() != ".pdf"]
@@ -727,20 +884,8 @@ if __name__ == "__main__":
     def extract_pdf_wrapper(fpath):
         timing_log = {}
         try:
-            # Patch extract_any to gate OCR
-            def _extract_any_with_ocr_gating(*a, **kw):
-                # Intercept _ocr_text_sidecar with semaphore
-                orig_ocr = _ocr_text_sidecar
-                def ocr_sidecar_with_sema(path, timeout=300):
-                    with ocr_semaphore:
-                        return orig_ocr(path, timeout=timeout)
-                globals()['_ocr_text_sidecar'] = ocr_sidecar_with_sema
-                try:
-                    return extract_any(*a, **kw)
-                finally:
-                    globals()['_ocr_text_sidecar'] = orig_ocr
             t0 = time.time()
-            out = _extract_any_with_ocr_gating(
+            out = extract_any(
                 fpath,
                 prefer_ocr=bool(args.prefer_ocr),
                 force_academic_pdf=bool(args.force_academic_pdf),
@@ -749,29 +894,11 @@ if __name__ == "__main__":
                 timing_log=timing_log,
             )
             t1 = time.time()
-            out["timings"]["wall"] = t1 - t0
+            out["timings"]["wall_elapsed"] = t1 - t0
             return (fpath, out, None)
         except Exception as e:
             return (fpath, None, e)
 
-    # Extraction function for local files
-    def extract_other_wrapper(fpath):
-        timing_log = {}
-        try:
-            t0 = time.time()
-            out = extract_any(
-                fpath,
-                prefer_ocr=False,
-                force_academic_pdf=False,
-                grobid_url=args.grobid_url,
-                allow_long_ocr=bool(args.allow_long_ocr),
-                timing_log=timing_log,
-            )
-            t1 = time.time()
-            out["timings"]["wall"] = t1 - t0
-            return (fpath, out, None)
-        except Exception as e:
-            return (fpath, None, e)
 
     # Use ThreadPoolExecutor for GROBID/PDFs, ProcessPoolExecutor for local
     pdf_results = []
@@ -782,15 +909,25 @@ if __name__ == "__main__":
             for fut in concurrent.futures.as_completed(futs):
                 pdf_results.append(fut.result())
     if other_files:
-        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as pool:
-            futs = [pool.submit(extract_other_wrapper, p) for p in other_files]
+        # On macOS, prefer `fork` to reduce pickling/purity issues for large local extraction.
+        # If `fork` is unavailable (or on other OSes), fall back to the default context.
+        import multiprocessing as mp
+        mp_ctx = mp.get_context("fork") if sys.platform == "darwin" else None
+
+        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers, mp_context=mp_ctx) as pool:
+            futs = [
+                pool.submit(extract_other_worker, str(p), bool(args.allow_long_ocr), str(args.grobid_url))
+                for p in other_files
+            ]
             for fut in concurrent.futures.as_completed(futs):
                 other_results.append(fut.result())
 
     # Combine results in original order
     fpath_to_result = {}
     for fpath, out, err in pdf_results + other_results:
-        fpath_to_result[str(fpath)] = (out, err)
+        # pdf_results returns Path; process pool returns string
+        key = str(fpath)
+        fpath_to_result[key] = (out, err)
 
     for fpath in files_to_extract:
         out, err = fpath_to_result.get(str(fpath), (None, None))
@@ -808,7 +945,9 @@ if __name__ == "__main__":
                 "ocr_used": None,
                 "extract_ok": False,
                 "extract_error": str(err),
-                "group": group_from_path(fpath, root),
+                "cohort_id": cohort_id,
+                "group_id": group_from_path(fpath, root_dir_for_group),
+                "group": group_from_path(fpath, root_dir_for_group),
             })
             print(f"[EXTRACT-ERROR] {fpath}: {err}")
             continue
@@ -833,7 +972,9 @@ if __name__ == "__main__":
             "ocr_used": bool(out.get("ocr_used")),
             "extract_ok": bool(out.get("text") or out.get("tei_xml")),
             "extract_error": None,
-            "group": group_from_path(fpath, root),
+            "cohort_id": cohort_id,
+            "group_id": group_from_path(fpath, root_dir_for_group),
+            "group": group_from_path(fpath, root_dir_for_group),
             "timings": out.get("timings", {}),
         }
         if sha in seen_sha:
@@ -848,7 +989,7 @@ if __name__ == "__main__":
             seen_sha.add(sha)
         # Print per-stage timing logs
         timing_info = out.get("timings", {})
-        timing_str = " ".join([f"{k}={v:.2f}s" for k, v in timing_info.items() if k != "total"])
+        timing_str = " ".join([f"{k}={v:.2f}s" for k, v in timing_info.items() if isinstance(v, (int, float))])
         print(f"[OK] extracted {fpath}  → sha={sha[:8]} tool={rec['extract_tool']} ocr={rec['ocr_used']} timings: {timing_str}")
 
     # Run verification if requested (or if verify-only)

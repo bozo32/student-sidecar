@@ -49,7 +49,37 @@ from sentence_transformers import SentenceTransformer, util
 
 # ------------------- Config -------------------
 
-TRIVIAL_PAT = re.compile(r"^(?:table|figure|fig\.?\s*\d+|graph|content|n\.?a\.?)$", re.I)
+
+# Treat these as non-verifiable / non-textual references when they appear as the entire quote.
+TRIVIAL_PAT = re.compile(r"^(?:table|figure|fig\.?\s*\d+|graph|chart|content|n\.?a\.?|na)$", re.I)
+
+# Broader hints that the student is pointing to a figure/table/graph rather than copyable text.
+NON_TEXTUAL_HINT_PAT = re.compile(
+    r"\b(?:figure|fig\.?|table|graph|chart|diagram|plot)\b|\bshown\s+in\b|\bsee\s+(?:figure|fig\.?|table)\b",
+    re.I,
+)
+def classify_quote_intent(q: str) -> str:
+    """Best-effort classification of what the quote seems to reference."""
+    qn = normalize_for_match(q)
+    if not qn:
+        return "empty"
+    if TRIVIAL_PAT.match(qn.strip()):
+        return "non_verifiable_trivial"
+    if NON_TEXTUAL_HINT_PAT.search(qn):
+        return "non_textual_hint"
+    return "textual"
+
+# SHA256 hex digest validator/normalizer
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+def normalize_sha256(v: object) -> Optional[str]:
+    """Normalize and validate a SHA256 hex digest (identity). Returns None if invalid."""
+    if v is None:
+        return None
+    s = str(v).strip().lower()
+    if not s or s in {"none", "nan", "null"}:
+        return None
+    return s if _SHA256_RE.match(s) else None
 
 DEFAULT_PARQUET_DIR = Path("artifacts/parquet")
 DEFAULT_TEXTS_DIR = Path("artifacts/text")
@@ -194,10 +224,19 @@ def verify_one_quote(
     fuzzy_thresh: int,
 ) -> Tuple[bool, Dict]:
     q = normalize_for_match(quote_from_source)
+    intent = classify_quote_intent(q)
     if not q:
-        return False, {"note": "empty quote_from_source"}
-    if TRIVIAL_PAT.match(q.strip()):
-        return False, {"note": "non-verifiable (generic: figure/table/N.A.)"}
+        return False, {
+            "verification_class": "empty",
+            "failure_reason": "empty_quote_from_source",
+            "note": "empty quote_from_source",
+        }
+    if intent == "non_verifiable_trivial":
+        return False, {
+            "verification_class": "non_verifiable",
+            "failure_reason": "trivial_or_non_verifiable",
+            "note": "non-verifiable (generic: figure/table/N.A.)",
+        }
 
     # BM25 retrieve
     nlp = _load_spacy()
@@ -209,11 +248,19 @@ def verify_one_quote(
     # top-k indices safely
     k = min(bm25_topk, len(scores))
     if k == 0:
-        return False, {"note": "no sentences in source"}
+        return False, {
+            "verification_class": "no_text_index",
+            "failure_reason": "no_sentences_in_source",
+            "note": "no sentences in source",
+        }
     top_idx = np.argpartition(-scores, range(k))[:k]
     top_idx = [int(i) for i in top_idx if 0 <= int(i) < len(sidx.sentences)]
     if not top_idx:
-        return False, {"note": "no valid candidates from BM25"}
+        return False, {
+            "verification_class": "no_candidates",
+            "failure_reason": "no_valid_candidates_from_bm25",
+            "note": "no valid candidates from BM25",
+        }
 
     # build windowed candidates around top_idx
     q_sents = split_sentences_simple(q)
@@ -247,7 +294,11 @@ def verify_one_quote(
                     seen_texts.add(cand_bwd_norm)
 
     if not candidates:
-        return False, {"note": "no valid candidates after windowing"}
+        return False, {
+            "verification_class": "no_candidates",
+            "failure_reason": "no_valid_candidates_after_windowing",
+            "note": "no valid candidates after windowing",
+        }
 
     cos = cosine_sim(q, candidates, encoder_name)
     fuzz = [partial_ratio(q, c) for c in candidates]
@@ -271,6 +322,13 @@ def verify_one_quote(
     elif len(q) > 200:
         cos_thr = min(cos_thr, 0.78)
 
+    thresholds_used = {
+        "cos_thresh_used": cos_thr,
+        "fuzzy_thresh_used": fz_thr,
+        "jaccard5_thresh_used": 0.65,
+        "bonus": bonus,
+    }
+
     ok_cos = (best_cos + bonus) >= cos_thr
     ok_fz = best_fz >= fz_thr
     ok_jac = best_jac >= 0.65
@@ -285,34 +343,54 @@ def verify_one_quote(
         if ok_jac:
             parts.append("jaccard5")
         note = "+".join(parts) + f" (bonus={bonus:.02f})"
+        # Determine a more specific verification class for auditing.
+        vclass = "semantic_match"
+        if best_fz >= 97 or (normalize_for_match(q) in normalize_for_match(best_cand)):
+            vclass = "exact_or_near_exact"
+        elif ok_jac and not ok_cos and not ok_fz:
+            vclass = "weak_match"
+
         return True, {
+            "verification_class": vclass,
             "candidate": best_cand,
             "span": best_span,
             "cosine": best_cos,
-            "bm25": float(scores[top_idx[0]]) if top_idx else None,
+            "bm25": float(np.max(scores[top_idx])) if top_idx else None,
             "fuzzy": best_fz,
             "jaccard5": best_jac,
+            **thresholds_used,
             "note": note,
         }
     else:
         # also surface 2nd-best if helpful
         sorted_idx = np.argsort(-cos)
         second_i = int(sorted_idx[1]) if len(candidates) > 1 else best_i
+        # If the quote hints at non-textual evidence (figure/table/graph), classify distinctly.
+        vclass = "no_match"
+        freason = "below_thresholds"
+        if intent == "non_textual_hint":
+            vclass = "non_textual_reference"
+            freason = "quote_points_to_figure_table_graph"
+
         return False, {
+            "verification_class": vclass,
+            "failure_reason": freason,
             "candidate": best_cand,
             "span": best_span,
             "cosine": best_cos,
-            "bm25": float(scores[top_idx[0]]) if top_idx else None,
+            "bm25": float(np.max(scores[top_idx])) if top_idx else None,
             "fuzzy": best_fz,
             "jaccard5": best_jac,
             "alt_idx": second_i if len(candidates) > 1 else None,
             "alt_cosine": float(cos[second_i]) if len(candidates) > 1 else None,
+            **thresholds_used,
             "note": "below thresholds",
         }
 
 # ------------------- Loading source indices -------------------
 
 def load_sentences_for_row(row: pd.Series, texts_dir: Path) -> Optional[List[str]]:
+    """Fallback loader when SHA-based lookup fails: try row-provided TEI/text paths."""
     # Prefer TEI sentences
     tei_path = row.get("tei_path")
     if isinstance(tei_path, str) and tei_path:
@@ -323,8 +401,12 @@ def load_sentences_for_row(row: pd.Series, texts_dir: Path) -> Optional[List[str
             sents = read_tei_sentences(tp)
             if sents:
                 return sents
-    # Else use plain text
-    text_path = row.get("source_text_path")
+
+    # Else use plain text (support both column names)
+    text_path = row.get("text_path")
+    if not (isinstance(text_path, str) and text_path):
+        text_path = row.get("source_text_path")
+
     if isinstance(text_path, str) and text_path:
         tp = Path(text_path)
         if not tp.is_absolute():
@@ -332,20 +414,51 @@ def load_sentences_for_row(row: pd.Series, texts_dir: Path) -> Optional[List[str
         if tp.exists():
             txt = tp.read_text(encoding="utf-8", errors="ignore")
             return sent_split_regex(txt)
+
     return None
 
-@lru_cache(maxsize=2048)
-def index_for_sha(sha: str, texts_dir: Path) -> Optional[SourceIndex]:
-    # This function will be provided with sha and will try to use TEI or TXT by sha file names
+
+@lru_cache(maxsize=4096)
+def index_for_sha_and_paths(sha: str, tei_path_str: str, text_path_str: str, texts_dir_str: str) -> Optional[SourceIndex]:
+    """Build a cached sentence index for a source.
+
+    Identity is `sha`. `tei_path_str`/`text_path_str` are metadata hints from sources.parquet.
+    We try explicit paths first, then fall back to texts_dir/<sha>.tei.xml and texts_dir/<sha>.txt.
+    """
     if not sha:
         return None
-    tei = texts_dir / f"{sha}.tei.xml"
-    txt = texts_dir / f"{sha}.txt"
+
+    texts_dir = Path(texts_dir_str)
+
+    # 1) Try explicit TEI/text paths from sources.parquet
+    tei_path = Path(tei_path_str) if tei_path_str else None
+    text_path = Path(text_path_str) if text_path_str else None
+
     sentences: Optional[List[str]] = None
-    if tei.exists():
-        sentences = read_tei_sentences(tei)
-    if not sentences and txt.exists():
-        sentences = sent_split_regex(txt.read_text(encoding="utf-8", errors="ignore"))
+
+    if tei_path is not None:
+        tp = tei_path
+        if not tp.is_absolute():
+            tp = texts_dir / tp.name
+        if tp.exists():
+            sentences = read_tei_sentences(tp)
+
+    if not sentences and text_path is not None:
+        tp = text_path
+        if not tp.is_absolute():
+            tp = texts_dir / tp.name
+        if tp.exists():
+            sentences = sent_split_regex(tp.read_text(encoding="utf-8", errors="ignore"))
+
+    # 2) Fallback: sha-addressed sidecars
+    if not sentences:
+        tei = texts_dir / f"{sha}.tei.xml"
+        txt = texts_dir / f"{sha}.txt"
+        if tei.exists():
+            sentences = read_tei_sentences(tei)
+        if not sentences and txt.exists():
+            sentences = sent_split_regex(txt.read_text(encoding="utf-8", errors="ignore"))
+
     if sentences:
         return build_bm25(sentences)
     return None
@@ -385,9 +498,24 @@ def main():
         print(f"[ERROR] {pairs_path} not found", file=sys.stderr)
         sys.exit(2)
     pairs = pd.read_parquet(pairs_path)
-    # sources currently unused directly; sentence loading is by sha files
+
+    sources_by_sha: Dict[str, Dict[str, str]] = {}
     if sources_path.exists():
-        _ = pd.read_parquet(sources_path)
+        sdf = pd.read_parquet(sources_path)
+        # Best-effort: collect TEI/text path hints per sha
+        if "source_sha256" in sdf.columns:
+            for _, r in sdf.iterrows():
+                sha = normalize_sha256(r.get("source_sha256"))
+                if not sha:
+                    continue
+                tei_p = r.get("tei_path")
+                txt_p = r.get("text_path")
+                if not (isinstance(txt_p, str) and txt_p):
+                    txt_p = r.get("source_text_path")
+                sources_by_sha[sha] = {
+                    "tei_path": tei_p if isinstance(tei_p, str) else "",
+                    "text_path": txt_p if isinstance(txt_p, str) else "",
+                }
 
     # Bucket by group
     groups = sorted(pairs["group_id"].dropna().unique())
@@ -404,19 +532,37 @@ def main():
                 continue
             if TRIVIAL_PAT.match(qsrc_raw.strip()):
                 sfn = source_filename_from_row(row)
-                bucket = by_source.setdefault(sfn, {"source_filename": sfn, "hits": 0, "misses": 0, "misses_detail": []})
+                sha = normalize_sha256(row.get("source_sha256"))
+                bucket = by_source.setdefault(
+                    sfn,
+                    {
+                        "source_filename": sfn,
+                        "hits": 0,
+                        "misses": 0,
+                        "misses_detail": [],
+                        "by_class": {},
+                    },
+                )
                 bucket["misses"] += 1
+                bucket["by_class"]["non_verifiable"] = bucket["by_class"].get("non_verifiable", 0) + 1
                 bucket["misses_detail"].append({
                     "row_index": int(row.get("row_index", -1)),
+                    "source_sha256": sha,
                     "claimed_quote": qsrc_raw,
-                    "notes": "non-verifiable (generic: figure/table/N.A.)"
+                    "verification_class": "non_verifiable",
+                    "failure_reason": "trivial_or_non_verifiable",
+                    "notes": "non-verifiable (generic: figure/table/N.A.)",
                 })
                 continue
 
-            sha = row.get("source_sha256")
+            sha = normalize_sha256(row.get("source_sha256"))
             sidx = None
-            if isinstance(sha, str) and sha:
-                sidx = index_for_sha(sha, texts_dir)
+            if sha:
+                meta = sources_by_sha.get(sha, {})
+                tei_hint = meta.get("tei_path", "")
+                txt_hint = meta.get("text_path", "")
+                sidx = index_for_sha_and_paths(sha, tei_hint, txt_hint, str(texts_dir))
+
             # Fallback: try to load from row-specific paths (rare, but helps when sha missing)
             if sidx is None:
                 sents = load_sentences_for_row(row, texts_dir)
@@ -424,26 +570,43 @@ def main():
                     sidx = build_bm25(sents)
 
             sfn = source_filename_from_row(row)
-            bucket = by_source.setdefault(sfn, {"source_filename": sfn, "hits": 0, "misses": 0, "misses_detail": []})
+            bucket = by_source.setdefault(
+                sfn,
+                {
+                    "source_filename": sfn,
+                    "hits": 0,
+                    "misses": 0,
+                    "misses_detail": [],
+                    "by_class": {},
+                },
+            )
 
             if sidx is None or not sidx.sentences:
                 bucket["misses"] += 1
+                bucket["by_class"]["no_text_index"] = bucket["by_class"].get("no_text_index", 0) + 1
                 bucket["misses_detail"].append({
                     "row_index": int(row.get("row_index", -1)),
+                    "source_sha256": sha,
                     "claimed_quote": qsrc_raw,
-                    "notes": "no text index available for source"
+                    "verification_class": "no_text_index",
+                    "failure_reason": "no_text_index_available",
+                    "notes": "no text index available for source",
                 })
                 continue
 
             ok, info = verify_one_quote(qsrc_raw, sidx, encoder_name, args.bm25_topk, args.cos_thresh, args.fuzzy_thresh)
+            vclass = info.get("verification_class", "hit" if ok else "miss")
+            bucket["by_class"][vclass] = bucket["by_class"].get(vclass, 0) + 1
+
             if ok:
                 bucket["hits"] += 1
             else:
                 bucket["misses"] += 1
                 bucket["misses_detail"].append({
                     "row_index": int(row.get("row_index", -1)),
+                    "source_sha256": sha,
                     "claimed_quote": qsrc_raw,
-                    **info
+                    **info,
                 })
 
         total_hits = sum(b["hits"] for b in by_source.values()) if by_source else 0

@@ -1,211 +1,195 @@
 
-### Why this matters
+# student-sidecar
 
-Unchecked citations are a weak link in both education and research. This sidecar workflow turns citation checking into an educational, auditable, data‑rich process: it strengthens the integrity of student work by requiring sound citation practice, reveals how sources were actually used (facilitating assessment and naturalising transparent reporting), and generates aligned text‑evidence pairs suitable for training and benchmarking discipline specific language models. 
+A workflow for turning messy student submissions of their supplemental active citation log into auditable evidence for teaching and provenance-rich datasets for retrieval, verification, and NLI research.
 
-This repository serves **two distinct audiences**:
-
-1. **Teachers** who want to make sound citation practice and transparent reporting a natural habit. The sidecar system enables instructors better to understand student engagement with the literature buy guiding and making visible proof of that engagement through steps that are trivial for good students and which block the most common forms of gen‑AI shortcutting.
-
-2. **Developers and researchers** building or testing **natural language inference (NLI)**, citation verification, or retrieval pipelines. The dataset produced links student claims to verified source evidence with full provenance, and includes all source documents plus content‑addressed sidecars so you can evaluate both *extraction/parsing* and *reasoning* robustness.
+The core idea is simple: keep student submissions intact, extract sidecar metadata, and make citation practice inspectable without automated accusation.
 
 ---
 
+## What this repository is for
 
-# 🧩 student-sidecar
+### For teachers
+This toolchain helps instructors:
+- see whether cited sources resolve to real documents,
+- check whether quoted passages actually appear in those sources,
+- flag rows that likely refer to figures, tables, or graphs rather than text,
+- optionally surface places where surrounding context may qualify or contradict a student’s claim.
 
-## 👩‍🏫 For Teachers: Auditing Student Submissions
+Outputs are designed for human review and discussion, not automated misconduct detection.
 
-The approach in this repository enables teachers to review student citation practice by operating on metadata (“sidecars”) produced by those students in the course of their normal engagement with the literature.
+### For developers / researchers
+The pipeline produces reproducible, mergeable datasets linking:
+1. `quote_from_report` — the student’s claim or paraphrase,
+2. `quote_from_source` — what the student says they copied,
+3. the **full original source document**.
 
-The script `process_submissions.py` scans each submission folder, creates previews of the first few rows of each CSV/XLS(X) table, and can **optionally fetch URLs** embedded in tables or Excel hyperlinks. This helps instructors quickly to spot missing sources.
-
-With `build_pairs.py`, the toolchain **identifies misaligned or problematic citations**. It includes a “graph_like” heuristic that flags cases where the quoted material seems to refer to a figure, table, or other non-running-text element, rather than actual text from the source. This is especially useful for highlighting when students cite images or data visualizations instead of quoting or paraphrasing written content and relevant for testing students, and models, extraction and interpretation of non-textual information from documents.
-
-Finally, the verification reports produced by `verify_quotes.py` provide teachers with a detailed summary of citation integrity. These reports indicate which quotes could be matched to the submitted sources, which were missed (and why). These diagnostics can be used as a basis for discussion with students about proper citation practices, integrity, and common pitfalls in academic writing.
-
-## 🧠 For Developers: Data for NLI Training
-
-This toolchain builds **three-layer paired data** connecting (1) a student’s quoted text from their report (`quote_from_report`), (2) the text they claim it came from in the source (`quote_from_source`), and (3) the full original source document from which that passage was drawn. The source is checked to determine whether the quoted portion actually appears there. The resulting dataset can be used to train or evaluate systems for citation verification, fact-checking, and natural language inference (NLI).
-
-The main outputs are:
-- `pairs_raw.parquet`: one row per citation pair.
-- JSON verification reports (from `verify_quotes.py`).
-- Plain-text and TEI sidecars for every unique source file.
-
-Extraction is handled in layers. GROBID is used for structured academic PDFs, OCR is applied only when text can’t be read directly, and lighter extractors handle HTML, DOCX, and similar files. The goal is full coverage with minimal noise.
-
-Because the dataset includes the **original source documents**, it supports not only NLI testing but also evaluation of extraction and parsing from messy, real-world documents. Every step records hashes and provenance, so results are reproducible.
-
-The pipeline:
-
-1) **process_submissions.py**
-   - **Input:** root folder with submission subfolders.
-   - **Does:** reads CSV/XLS(X), prints 4‑row previews, optionally fetches HTTP/HTTPS links discovered in cells or Excel hyperlinks.
-   - **Creates:** `previews/` CSV heads; `<group>/urls/` with downloaded files and a `_manifest.csv`.
-
-2) **extract_text.py**
-   - **Input:** root (or a single group/folder).
-   - **Does:** computes SHA256 of each source; extracts plain text (PyMuPDF/HTML/DOCX/TXT), calls **GROBID** for academic PDFs (TEI), OCR only when needed.
-   - **Creates:** `artifacts/text/<sha>.txt` (+ `<sha>.tei.xml` when TEI exists) and `artifacts/parquet/sources.parquet`.
-   - **Notes:** idempotent (skips already‑extracted SHA sidecars); content‑addressed and reproducible.
-
-3) **build_pairs.py**
-   - **Input:** normalized tables + extracted sidecars (`artifacts/text`) and `sources.parquet`.
-   - **Does:** normalizes columns to `quote_from_report | file_name | quote_from_source`, resolves `file_name` to actual files (fuzzy match, Excel hyperlink handling), consolidates any `<group>/urls/_manifest.csv`, tags **graph_like** candidates.
-   - **Creates:** `artifacts/parquet/pairs_raw.parquet`, `artifacts/parquet/tables_report.{parquet,csv}`, and `artifacts/parquet/urls_manifest.parquet` (if URLs were consolidated).
-
-4) **verify_quotes.py**
-   - **Input:** `pairs_raw.parquet` + sidecars in `artifacts/text/`.
-   - **Does:** verifies that `quote_from_source` appears in the referenced source via **BM25 → SBERT cosine → fuzzy/Jaccard** cascade; handles multi‑sentence windows; skips trivial figure/table strings.
-   - **Creates:** per‑group JSON in `artifacts/verification/` (+ optional flat summary parquet/csv when `--summary` is set).
-
-> Designed to be resilient to messy student data (odd encodings, inconsistent filenames, extra columns, Excel hyperlinks, etc.).
-
-At this point student assessment asks whether the 'quote from source' provided by the student can, indeed, be found in that source. For easily parsable source documents where the relevant information is in body text, this expectation performs very well. The same can not be said for messy documents or supporting information found in non-textual features. At this point I am running the assumption that students will not willfully submit false information in these tables so failures to detect are more likely attributable to shortcomings in these scripts. 
+All sources are content-addressed by **SHA256**, enabling cross-cohort merging and downstream work.
 
 ---
 
-## 🚀 Quick Start
+## Core design principle: content-addressed sources
+
+- `source_sha256` is the identity.
+- File paths are metadata, not identifiers.
+- Text sidecars live at `artifacts/text/<sha>.txt` (and `<sha>.tei.xml` when available).
+
+This makes results reproducible, mergeable across classes, and robust to renamed files.
+
+---
+
+## Quick start
 
 ```bash
-# 1) Create a clean environment
 conda create -n student_sidecar python=3.10 -y
 conda activate student_sidecar
-
-# 2) Install requirements
 pip install -r requirements.txt
+```
 
-# 3) (Recommended) Start GROBID for academic PDFs
-# Option A: Docker (Intel/AMD and Apple Silicon both supported via multi-arch)
+### Run GROBID (recommended for academic PDFs)
+
+```bash
 docker run --rm -it -p 8070:8070 -p 8071:8071 lfoppiano/grobid:0.8.0
-# Option B: local build
-#  (from grobid repo) ./gradlew :grobid-service:run
-# The scripts expect the service at http://localhost:8070 by default.
 ```
-
-> **Data layout expected** (you can point the tools at the root folder):
->
-> ```
-> /path/to/root/
-> ├── Group 1 supplemental information/
-> │   ├── group_1.xlsx (or .csv)
-> │   ├── source_1.pdf
-> │   └── …
-> ├── Group 2 supplemental information/
-> │   ├── group_2.csv
-> │   ├── urls/ (optional; created by process_submissions)
-> │   └── …
-> └── …
-> ```
 
 ---
 
-## 📦 What gets created
+## Data requirements (what students submit)
 
-All scripts write into `artifacts/` (relative to your current working directory):
+This pipeline assumes a very specific submission structure. Most failures and warnings are caused by deviations from this structure.
+
+### Required folder structure
+When processing, reference the <class_or_assignment_folder> as the target path. Starting from there, the structure must be:
 
 ```
-artifacts/
-  text/                   # SHA256-named sidecars: <sha>.txt and <sha>.tei.xml
-  parquet/
-    sources.parquet       # one row per unique source (sha, paths, mime, extract status)
-    pairs_raw.parquet     # one row per table row (normalized), with resolved source path/sha
-    urls_manifest.parquet # normalized records for every URL captured/downloaded
-    tables_report.{parquet,csv}  # per-table diagnostics (nonempty rows vs extracted/resolved)
-  verification/
-    Group_<…>.json        # per‑group verification reports (see verify_quotes)
+<class_or_assignment_folder>/
+  <group_identifier_1>/
+    references.xlsx   (or .csv)
+    cited_file_1.pdf
+    cited_file_2.pdf
+    ...
+  <group_identifier_2>/
+    references.xlsx
+    cited_file_1.pdf
+    ...
 ```
 
-Sidecar file names are **content addressed** by SHA256 of the original bytes, so the same file from two groups only extracts once: `artifacts/text/<sha>.txt` and (if academic PDF) `artifacts/text/<sha>.tei.xml`.
+- Each **group** must have its **own folder**.
+- The group folder name is treated as the authoritative `group_id`.
+- There must be **exactly one citation table per group folder**.
+- All locally cited files must live **in the same folder as the table**.
+
+Nested folders inside a group folder are not supported.
+
+---
+### What students submit
+
+Students should submit **one ZIP file**, which when unzipped contains **a single top-level folder**.
+
+Each group must submit **one table** (`.xlsx`, `.xls`, or `.csv`) listing their sources.
+
+The table must contain at least the following columns (column names are matched case-insensitively and with normalization):
+
+| Column name | Meaning |
+|------------|--------|
+| `quote_from_report` | The sentence or claim from the student’s report that relies on the source |
+| `quote_from_source` | The passage the student claims comes from the source (may be paraphrased) |
+| `filename` | Name of the cited file **exactly as it appears in the group folder** |
+| `url` | Optional. Direct URL to the source if no local file is provided |
+
+Additional columns are allowed and preserved, but ignored by the analysis.
 
 ---
 
-## 1) `process_submissions.py`
+### Local files vs URLs (important)
 
-Walk subdirectories, preview the first 4 rows of each CSV/XLS, and (optionally) download URLs embedded in cells or Excel hyperlinks.
+Students must include **all cited sources as files**, **except** when the source is:
+
+- directly (i.e. no click-through) and publicly accessible via a stable URL (e.g. journal article, report page),
+- not behind authentication,
+- not dynamically generated,
+
+Rules:
+
+- If a row contains a `filename`, that file **must exist** in the group folder.
+- If a row contains a `url` **and no filename**, the pipeline will attempt to fetch it.
+- If both are present, the local file takes precedence.
+
+Broken filenames and inaccessible URLs are reported but do not stop the pipeline.
+
+---
+
+### What is *not* supported
+
+- Multiple citation tables per group
+- Citation tables split across folders
+- References to files outside the group folder
+- Handwritten PDFs or images without OCR
+- Nested group folders
+
+---
+
+### Why these constraints exist
+
+These constraints are intentional:
+
+- they keep student submissions auditable,
+- they prevent accidental cross-group contamination,
+- they allow sources to be content-addressed and merged across cohorts.
+
+When teaching, it is strongly recommended to **provide students with a template ZIP** that already follows this structure.
+
+---
+
+
+## Recommended workflow
+
+### One-command processing almost all of the way 
+
+This script:
+- runs text extraction,
+- rebuilds citation pairs,
+- verifies quoted passages,
+- runs cherry-picking triage,
+- and prints a clear completion banner.
+
+It is the recommended entry point for routine checking of files submitted by student analysis.
+
+Example:
 
 ```bash
-python process_submissions.py /path/to/root \
-  [--fetch-urls] [--urls-subdir urls] [--url-timeout 20]
+python full_cohort.py "/path/to/cohort/root"
 ```
 
-**Behavior**
-- Detects `.csv`, `.tsv`, `.xls`, `.xlsx`, `.xlsm`.
-- Prints per‑file summary (path, inferred delimiter, normalized columns, 4‑row head).
-- Writes normalized 4‑row previews to `./previews/`.
-- If `--fetch-urls` is set:
-  - Ignores *local* file links (e.g., `file:///`, `C:\\…`, macOS file paths).
-  - Downloads **HTTP/HTTPS** links into `<group>/urls/` and records `_manifest.csv`.
-  - Extracts text from HTML via `trafilatura` when possible.
+This will **replace** all derived artifacts in `artifacts/` for that cohort.  
+Use this only when you are ready to commit to a full rebuild.
 
----
+full_cohort.py automatically runs the scripts below in sequence. These scripts can also be run individually for more control.
 
-## 2) `extract_text.py`
-
-Content-address every discovered binary and produce text/TEI sidecars. This is safe to run repeatedly; it skips sources that already have sidecars.
-
+1) **Preview submissions and (optionally) capture URLs**
 ```bash
-python extract_text.py /path/to/root \
+python process_submissions.py "/path/to/root" --fetch-urls
+```
+
+2) **Extract text and TEI sidecars**
+```bash
+python extract_text.py "/path/to/root" \
   --texts-dir artifacts/text \
   --parquet-dir artifacts/parquet \
-  [--grobid-url http://localhost:8070] \
-  [--force-academic-pdf]              # force PDF → GROBID even if text is extractable
-  [--overwrite]                       # re-extract even if sidecars already exist
+  --extensions ".pdf,.docx,.html,.htm,.txt,.md,.rst" \
+  --grobid-url http://localhost:8070
 ```
 
-**Notes**
-- Hashing is on **original file bytes**. Output files are `<sha>.txt` and optionally `<sha>.tei.xml`.
-- Academic PDFs are routed to GROBID (header+fulltext TEI). Non‑academic PDFs and other formats fall back to `pdfminer.six`, `pypdf`, `mammoth` (DOCX→HTML→text), `trafilatura`, etc.
-- Writes/updates `artifacts/parquet/sources.parquet`.
-
-**Sanity check**
-```bash
-python check_missing_sidecars.py --parquet artifacts/parquet/sources.parquet \
-  --texts-dir artifacts/text
-```
-
----
-
-## 3) `build_pairs.py`
-
-Normalize messy student tables into a single dataset and line them up with extracted sources. Also consolidates any URLs captured by `process_submissions.py`.
-
+3) **Normalize tables and build citation pairs**
 ```bash
 python build_pairs.py "/path/to/root" \
   --texts-dir artifacts/text \
   --parquet-dir artifacts/parquet \
-  --consolidate-urls \
-  --urls-subdir urls \
-  --grobid-url http://localhost:8070 \
-  [--prefer-excel] [--fallback-csv] [--csv-encoding-sweep]
+  --prefer-excel --fallback-csv --csv-encoding-sweep \
+  --consolidate-urls --urls-subdir urls
 ```
 
-**What it does**
-- Reads each group’s CSV/XLS(X) and normalizes column names to:
-  - `quote_from_report`, `file_name`, `quote_from_source` (handles common variants and extra columns; for sheets that include an extra leading label column like *Section*, it drops/renames appropriately).
-- Handles Excel hyperlinks: uses the **displayed text** as filename when the link points to a local file; preserves **HTTP/HTTPS** as URL candidates.
-- Fuzzy‑matches `file_name` to actual files in the group folder; if multiple candidates tie, it prefers PDFs.
-- Emits **diagnostic table** `tables_report.{parquet,csv}` with, per table/sheet: nonempty rows, extracted rows, resolved paths, success ratios. Use it to find messy submissions fast.
-- Updates/creates:
-  - `artifacts/parquet/pairs_raw.parquet`
-  - `artifacts/parquet/sources.parquet` (merged paths and hashes)
-  - `artifacts/parquet/urls_manifest.parquet` (if `--consolidate-urls`)
-
-**Tip**: If you have already run `extract_text.py`, `build_pairs.py` will **not** re‑extract content; it will just align table rows to existing sidecars via SHA/paths.
-
----
-
-## 4) `verify_quotes.py`
-
-Try to verify that each `quote_from_source` actually appears in the referenced source. It uses a robust cascade:
-
-1. **BM25** to pull top‑K candidate sentences from the source sidecar.
-2. **Sentence‑BERT** cosine for semantic matching.
-3. **Fuzzy** (token sort ratio) and **5‑gram Jaccard** to catch near‑verbatim snippets.
-4. **Multi‑line** handling: splits quoted text into sentences and searches sliding windows.
-5. Skips trivial entries (e.g., “table”, “figure”, “n.a.”).
-
+4) **Verify quoted source text**
 ```bash
 python verify_quotes.py \
   --parquet-dir artifacts/parquet \
@@ -213,54 +197,199 @@ python verify_quotes.py \
   --out-dir artifacts/verification \
   --encoder all-MiniLM-L6-v2 \
   --bm25-topk 20 --cos-thresh 0.82 --fuzzy-thresh 85 \
-  [--summary parquet]   # also write a flat parquet with per-row results
+  --summary-csv
 ```
 
-**Outputs**
-- One JSON per group under `artifacts/verification/` summarizing:
-  - success ratio, 
-  - per‑source filename → found/missed quotes,
-  - notes for misses (e.g., trivial generic text, encoding/sanitization issues).
-
----
-
-## 🔍 Suggested end‑to‑end
-
+5) **Optional: sniff for contextual qualification or contradiction**
 ```bash
-# 0) Ensure GROBID is running (optional but recommended for academic PDFs)
-# docker run --rm -it -p 8070:8070 lfoppiano/grobid:0.8.0
-
-# 1) Quick scan + (optional) URL capture
-python process_submissions.py "/path/to/root" --fetch-urls --url-timeout 20
-
-# 2) Extract text once for all sources
-python extract_text.py "/path/to/root" \
-  --texts-dir artifacts/text --parquet-dir artifacts/parquet --force-academic-pdf
-python check_missing_sidecars.py --parquet artifacts/parquet/sources.parquet --texts-dir artifacts/text
-
-# 3) Normalize tables and build pairs + diagnostics
-python build_pairs.py "/path/to/root" \
-  --texts-dir artifacts/text --parquet-dir artifacts/parquet \
-  --consolidate-urls --urls-subdir urls --grobid-url http://localhost:8070 \
-  --prefer-excel --fallback-csv --csv-encoding-sweep
-
-# 4) Verify quotes
-python verify_quotes.py --parquet-dir artifacts/parquet --texts-dir artifacts/text \
-  --out-dir artifacts/verification --encoder all-MiniLM-L6-v2 \
-  --bm25-topk 20 --cos-thresh 0.82 --fuzzy-thresh 85 --summary parquet
+python sniff_cherrypicking.py \
+  --parquet-dir artifacts/parquet \
+  --texts-dir artifacts/text \
+  --out-dir artifacts/cherrypicking \
+  --query-field quote_from_report \
+  --cheap-only
 ```
 
 ---
 
-## 🧪 Troubleshooting & Tips
+## Outputs
 
-- **CSV encoding errors**: use `--csv-encoding-sweep` (build_pairs) or convert manually to UTF‑8.
-- **Ghostscript warnings** during OCR/repair: they’re harmless here; we avoid destructive rewrite by default.
-- **Performance**: extraction is content‑addressed; repeated runs are fast. Keep `artifacts/text/` around for reuse.
-- **Apple Silicon**: the GROBID Docker image is multi‑arch; if you built locally, ensure Java 17+ and enough heap (`JAVA_OPTS=-Xms1g -Xmx4g`).
+All scripts write to `artifacts/`:
+
+```
+artifacts/
+  text/                   # <sha>.txt and <sha>.tei.xml
+  parquet/
+    sources.parquet
+    pairs_raw.parquet
+    tables_report.{parquet,csv}
+    urls_manifest.parquet
+  verification/
+    Group_<...>.json
+    verification_summary.csv
+  cherrypicking/
+    cherrypicking_report.json
+    cherrypicking_candidates.parquet
+    cherrypicking_summary.csv
+```
+
+## Understanding the outputs (for teachers)
+
+This workflow produces several kinds of outputs, each designed for a **different teaching purpose**. None of them are meant to be read raw by students; they are tools for **instructor review, diagnosis, and discussion**.
+
+The outputs do **not** label misconduct. They surface *evidence and context* so that you can decide what, if anything, to do pedagogically.
 
 ---
 
-## 📄 License
+### 1. `tables_report.csv` — How well did groups cite, structurally?
 
-MIT © 2025 Bozo32
+**What it is**  
+A per-table diagnostic summary of each group’s submitted citation table(s).
+
+**What it tells you**
+- How many rows in each table contained something that *looked like* a citation.
+- How many rows could be resolved to an actual source file or URL.
+- How many rows were extractable as text (vs figures, tables, graphs, or broken references).
+
+**How a teacher uses it**
+- Identify groups who struggled *procedurally* (file naming, broken links, malformed spreadsheets).
+- Separate **formatting / workflow problems** from **conceptual citation problems**.
+- Decide which groups need technical remediation vs citation instruction.
+
+---
+
+### 2. `verification_summary.csv` — Do the quoted passages appear in the source?
+
+**What it is**  
+A per-group summary of quote-matching results.
+
+**What it tells you**
+- For each group:
+  - how many cited quotes were checked,
+  - how many had a close textual match in the cited source,
+  - how many did not.
+
+**How a teacher uses it**
+- Spot groups where **many quoted passages are not actually present** in the cited documents.
+- Decide where to open a discussion about paraphrasing vs quotation.
+- Prioritize which groups to inspect more closely.
+
+**Important caveat**  
+A “no match” does **not** mean misconduct. The student may have paraphrased, the content may be in a figure or table, or the source may be scanned or poorly extracted.
+
+---
+
+### 3. `verification/Group_<…>.json` — Evidence for discussion
+
+**What it is**  
+A detailed, per-group evidence file.
+
+**What it contains**
+- the student’s quoted or paraphrased text,
+- the best-matching passages found in the source,
+- similarity scores (lexical and semantic),
+- the exact location in the source text.
+
+**How a teacher uses it**
+- Prepare examples for class discussion.
+- Walk through *how citation works in practice*.
+- Show students what “good” vs “weak” evidence alignment looks like.
+
+---
+
+### 4. `cherrypicking_teacher.csv` — Fast triage for instructors
+
+**What it is**  
+A flattened, human-readable table meant specifically for teachers.
+
+**What it shows**
+- the student’s claim (from the report),
+- the cited source,
+- a nearby passage from the source,
+- similarity scores,
+- lexical signals that the passage may **qualify, limit, or contradict** the claim.
+
+**How a teacher uses it**
+- Quickly scan potentially problematic claims.
+- Identify cases of selective quoting or over-generalization.
+- Choose concrete examples for feedback or seminars.
+
+---
+
+### 5. `cherrypicking_report.json` — Structured context for deeper review
+
+**What it is**  
+A structured (JSON) version of the cherry-picking analysis.
+
+**What it contains**
+- All candidate passages considered for each claim.
+- Grouping by student claim and source.
+- Flags indicating whether deeper analysis (e.g. NLI) may be useful.
+
+This is primarily intended for future dashboards or interactive tools.
+
+---
+
+### 6. Optional: `nli_results.csv` / `nli_results.parquet` — Does the source contradict the claim?
+
+**What it is**  
+An optional Natural Language Inference (NLI) pass run **only on flagged cases**.
+
+**What it tells you**
+- whether a source passage *entails*, *contradicts*, or is *neutral* with respect to the student’s claim,
+- with model confidence scores.
+
+**How a teacher uses it**
+- As a prioritization aid, not a verdict.
+- To distinguish paraphrasing issues from possible misrepresentation.
+
+**Strong warning**  
+NLI results are **suggestive, not authoritative**, and should never be used as automated judgments.
+
+---
+
+### What you are not getting
+
+This pipeline deliberately avoids producing:
+- automatic accusations,
+- plagiarism scores,
+- misconduct labels.
+
+Instead, it produces **auditable evidence and context** suitable for teaching, feedback, and reflection.
+
+---
+
+## Multi-class / multi-cohort use
+
+Label each dataset root by cohort (e.g. `2025_p1_yrm20306`).
+
+- `extract_text.py` records `cohort_id` and `group_id`.
+- Outputs can be kept per-cohort or merged later by `source_sha256`.
+- A shared `artifacts/text/` directory safely deduplicates sources across cohorts.
+
+---
+
+## Details
+
+### process_submissions.py
+Scans group folders, previews CSV/XLS(X) tables, and optionally downloads HTTP/HTTPS URLs found in cells or Excel hyperlinks.
+
+### extract_text.py
+Hashes original bytes, extracts text sidecars, routes academic PDFs through GROBID, and records timing and provenance in `sources.parquet`. Extraction is idempotent and cohort-aware.
+
+### build_pairs.py
+Normalizes messy tables into a single row-level dataset, resolves filenames to actual sources (including Excel hyperlinks), flags graph-like references, and produces table-level diagnostics.
+
+### verify_quotes.py
+Checks whether `quote_from_source` appears in the cited source using a BM25 → embedding → fuzzy cascade, producing per-group JSON and summary CSVs.
+
+### sniff_cherrypicking.py (experimental)
+Performs a teacher-facing triage pass to surface nearby source passages that may qualify, limit, or contradict a student’s claim. Runs cheaply by default and can optionally apply NLI when explicitly enabled.
+
+This script is intended to **support human judgment**, not automate accusations.
+
+---
+
+## License
+
+MIT © 2025

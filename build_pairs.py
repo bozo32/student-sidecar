@@ -1,3 +1,24 @@
+from __future__ import annotations
+import re
+
+# --- SHA256 normalization helper ---
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+def normalize_sha256(v: object) -> Optional[str]:
+    """Return a validated lowercase sha256 hex string, or None.
+
+    Defensive: some upstream extractors may accidentally emit the literal string "None".
+    """
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not s:
+        return None
+    low = s.lower()
+    if low in {"none", "nan", "null"}:
+        return None
+    if _SHA256_RE.match(low):
+        return low
+    return None
 
 
 #!/usr/bin/env python3
@@ -33,25 +54,20 @@ Flags:
   --fallback-csv: When preferring Excel, also use CSVs if no Excel files found
   --csv-encoding-sweep: Try multiple encodings for CSV reading if needed
 """
-from __future__ import annotations
 
 import argparse
 import csv
 import hashlib
 import io
 import json
-import math
 import re
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
-
-import time
-import math
-import threading
 
 
 # ----------------- Graph/figure reference tagging -----------------
@@ -122,7 +138,14 @@ def _strip_excel_hyperlinks(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # Local module providing robust, layered extraction, OCR, and GROBID
+import extract_text
 from extract_text import extract_any
+
+# Optional: only present if extract_text defines it
+try:
+    from extract_text import RateLimiter  # type: ignore
+except Exception:  # pragma: no cover
+    RateLimiter = None  # type: ignore
 
 # ----------------- Defaults / Paths -----------------
 
@@ -146,12 +169,35 @@ URL_RE = re.compile(r"""(?i)\bhttps?://[^\s<>'"]+""")
 # Group-14 style extra column / “last column is the actual target” fallback
 TRAILING_TARGET_OK = True
 
+# ----------------- GROBID controls helper -----------------
+from typing import Optional
+def _init_grobid_controls(grobid_rps: Optional[float], grobid_timeout: int, grobid_max_retries: int) -> None:
+    """Initialize throttling/retry globals inside extract_text (used by extract_any).
+
+    This keeps GROBID behavior consistent between extract_text.py and build_pairs.py.
+    """
+    # Not all versions of extract_text expose these symbols; set them if present.
+    try:
+        if hasattr(extract_text, "GROBID_MAX_RETRIES"):
+            extract_text.GROBID_MAX_RETRIES = int(grobid_max_retries)
+        if hasattr(extract_text, "GROBID_TIMEOUT"):
+            extract_text.GROBID_TIMEOUT = int(grobid_timeout)
+        if hasattr(extract_text, "GROBID_LIMITER"):
+            if RateLimiter is not None and grobid_rps and grobid_rps > 0:
+                extract_text.GROBID_LIMITER = RateLimiter(grobid_rps)
+            else:
+                extract_text.GROBID_LIMITER = None
+    except Exception:
+        # Never fail the pipeline just because throttling globals aren't available
+        return
+
 # ----------------- Utilities -----------------
 
 def sha256_bytes(b: bytes) -> str:
     h = hashlib.sha256()
     h.update(b)
     return h.hexdigest()
+
 
 def normalize_header_names(cols: List[str]) -> List[str]:
     out = []
@@ -490,8 +536,7 @@ def fuzzy_pick_path(group_dir: Path, fn_raw: str) -> Optional[Path]:
     norm_target = norm(fn_tail)
     # Try removing extension from both sides
     norm_target_noext = norm(Path(fn_tail).stem)
-
-# Enhanced token-overlap scoring (more robust to punctuation/order/noise)
+    # Enhanced token-overlap scoring (more robust to punctuation/order/noise)
     def token_set(s: str) -> set[str]:
         s = re.sub(r"[^a-z0-9]+", " ", s.lower())
         toks = [t for t in s.split() if t]
@@ -518,13 +563,15 @@ def fuzzy_pick_path(group_dir: Path, fn_raw: str) -> Optional[Path]:
 
 # ----------------- URL manifest consolidation -----------------
 
-def build_url_map(root: Path, urls_subdir: str = "urls") -> Dict[Tuple[str, str], Path]:
+def build_url_map(root: Path, urls_subdir: str = "urls", include_groups: Optional[list[str]] = None) -> Dict[Tuple[str, str], Path]:
     """
     Return a mapping {(group_id, url) -> local_saved_file_path} from per-group urls/_manifest.csv files.
     """
     mapping: Dict[Tuple[str, str], Path] = {}
     for group in sorted(p for p in root.iterdir() if p.is_dir()):
         gid = group.name
+        if include_groups and not _group_selected(gid, include_groups):
+            continue
         m = group / urls_subdir / "_manifest.csv"
         if not m.exists():
             continue
@@ -570,10 +617,16 @@ class PairRow:
     quote_from_report: str
     file_name_raw: str
     quote_from_source: str
-    source_uri: Optional[str]
+
     table_path: str
     sheet_name: str
     row_index: int
+
+    source_uri: Optional[str] = None
+    # Identity semantics
+    source_ref_type: str = "unresolved"  # one of: sha256, url, unresolved
+    source_ref: str = ""                 # normalized identity: sha256:<hex> | url:<url> | unresolved:<raw>
+
     resolved_source_path: Optional[str] = None
     source_sha256: Optional[str] = None
     source_text_path: Optional[str] = None
@@ -620,6 +673,9 @@ def process_one_row(group_dir: Path,
                     row: pd.Series,
                     force_academic_pdf: bool,
                     grobid_url: Optional[str],
+                    grobid_rps: Optional[float],
+                    grobid_timeout: int,
+                    grobid_max_retries: int,
                     url_map: Optional[Dict[Tuple[str, str], Path]] = None) -> PairRow:
     # Pull values safely
     q_report = _cell_str(row, "quote_from_report")
@@ -637,6 +693,9 @@ def process_one_row(group_dir: Path,
     if URL_RE.search(file_raw):
         source_uri = file_raw.strip()
 
+    source_ref_type = "unresolved"
+    source_ref = f"unresolved:{file_raw.strip()}"
+
     # Resolve local path (if any), ignoring URLs
     resolved: Optional[Path] = None
     if not source_uri:
@@ -646,7 +705,7 @@ def process_one_row(group_dir: Path,
         mapped = url_map.get((group_id, source_uri))
         if mapped and mapped.exists():
             resolved = mapped
-            source_uri = source_uri  # keep original URI for lineage
+            # keep original URI for lineage; identity becomes sha256 once resolved
             
     # If we still have no source and no local file, scan all columns for URLs
     if not source_uri and not resolved:
@@ -663,6 +722,10 @@ def process_one_row(group_dir: Path,
                     if mapped and mapped.exists():
                         resolved = mapped
                 break        
+    # If we have a URL but no resolved local file yet, treat the URL as identity for now.
+    if source_uri and not resolved:
+        source_ref_type = "url"
+        source_ref = f"url:{source_uri}"
 
     # Extract text/tei if we found a file
     sha = None
@@ -680,6 +743,8 @@ def process_one_row(group_dir: Path,
             sha = sha256_bytes(byts)
             text_path = texts_dir / f"{sha}.txt"
             tei_path = texts_dir / f"{sha}.tei.xml"
+            source_ref_type = "sha256"
+            source_ref = f"sha256:{sha}"
 
             # If either artifact already exists, skip expensive extraction
             if text_path.exists() or tei_path.exists():
@@ -687,14 +752,29 @@ def process_one_row(group_dir: Path,
                 ocr_used = None
                 extract_ok = True
             else:
-                res = extract_any(
-                    resolved,
-                    prefer_ocr=False,
-                    force_academic_pdf=force_academic_pdf,
-                    grobid_url=grobid_url,
-                )
+                # Ensure GROBID retry/timeout/RPS are consistent with extract_text.py CLI
+                _init_grobid_controls(grobid_rps=grobid_rps, grobid_timeout=grobid_timeout, grobid_max_retries=grobid_max_retries)
+
+                # Call extract_any with only the kwargs it supports (backward compatible)
+                import inspect
+                sig = inspect.signature(extract_any)
+                kwargs = {
+                    "prefer_ocr": False,
+                    "force_academic_pdf": force_academic_pdf,
+                    "grobid_url": grobid_url,
+                }
+                # Some versions may accept extra parameters; add only if present
+                if "grobid_timeout" in sig.parameters:
+                    kwargs["grobid_timeout"] = grobid_timeout
+                if "grobid_max_retries" in sig.parameters:
+                    kwargs["grobid_max_retries"] = grobid_max_retries
+
+                res = extract_any(resolved, **kwargs)
                 # prefer sha from extractor if provided, but keep computed as fallback
                 sha = res.get("sha256", sha)
+                if sha:
+                    source_ref_type = "sha256"
+                    source_ref = f"sha256:{sha}"
 
                 if res.get("text"):
                     if not text_path.exists():
@@ -710,6 +790,9 @@ def process_one_row(group_dir: Path,
         except Exception as e:
             extract_err = str(e)[:500]
 
+    # Final sanitation: ensure sha is normalized
+    sha = normalize_sha256(sha)
+
     return PairRow(
         cohort_id=cohort_id,
         group_id=group_id,
@@ -718,6 +801,8 @@ def process_one_row(group_dir: Path,
         file_name_raw=file_raw.strip(),
         quote_from_source=q_source.strip(),
         source_uri=source_uri,
+        source_ref_type=source_ref_type,
+        source_ref=source_ref,
         table_path=str(table_path),
         sheet_name=sheet_name,
         row_index=int(ridx),
@@ -733,15 +818,51 @@ def process_one_row(group_dir: Path,
         graph_reason=greason,
     )
 
+def _parse_include_groups(spec: str) -> list[str]:
+    if not spec:
+        return []
+    parts = [p.strip() for p in str(spec).split(",")]
+    return [p for p in parts if p]
+
+def _group_selected(group_name: str, include: list[str]) -> bool:
+    """Return True if group_name should be processed under include list.
+
+    Matching rules:
+      - Exact folder-name match (case-sensitive or case-insensitive): token equals group_name.
+      - Numeric token like '5' matches case-insensitive substring 'group 5' in folder name.
+      - Non-numeric token matches case-insensitive substring in folder name.
+    """
+    if not include:
+        return True
+    g_low = str(group_name).lower()
+    for tok in include:
+        t = str(tok).strip()
+        if not t:
+            continue
+        if t == group_name or t.lower() == g_low:
+            return True
+        if t.isdigit():
+            if f"group {int(t)}" in g_low:
+                return True
+        else:
+            if t.lower() in g_low:
+                return True
+    return False
+
 def build_all_pairs(
     root: Path,
     texts_dir: Path,
     force_academic_pdf: bool,
     grobid_url: Optional[str],
+    grobid_rps: Optional[float],
+    grobid_timeout: int,
+    grobid_max_retries: int,
     prefer_excel: bool = False,
     fallback_csv: bool = False,
     csv_encoding_sweep: bool = False,
     url_map: Optional[Dict[Tuple[str, str], Path]] = None,
+    workers: int = 6,
+    include_groups: Optional[list[str]] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Return (pairs_df, sources_df, stats_df)
@@ -754,6 +875,8 @@ def build_all_pairs(
     for group in sorted(p for p in root.iterdir() if p.is_dir()):
         group_id = group.name
         cohort_id = "cohort-1"  # placeholder; extend if you have multiple cohorts
+        if include_groups and not _group_selected(group_id, include_groups):
+            continue
 
         # Tables
         for table_path, sheet, df in iter_group_tables(
@@ -773,45 +896,58 @@ def build_all_pairs(
             extract_err_count = 0
             graphlike_count = 0
 
-            # Iterate rows
-            for ridx, row in df.iterrows():
-                pr = process_one_row(
-                    group_dir=group,
-                    texts_dir=texts_dir,
-                    cohort_id=cohort_id,
-                    group_id=group_id,
-                    table_path=table_path,
-                    sheet_name=sheet,
-                    ridx=ridx,
-                    row=row,
-                    force_academic_pdf=force_academic_pdf,
-                    grobid_url=grobid_url,
-                    url_map=url_map,
-                )
-                pairs.append(pr.__dict__)
+            # Iterate rows (threaded: I/O-bound for file reads + HTTP to GROBID)
+            from concurrent.futures import ThreadPoolExecutor, as_completed
 
-                # Update stats
-                any_nonempty = (
-                    _def_nonempty(pr.quote_from_report)
-                    or _def_nonempty(pr.file_name_raw)
-                    or _def_nonempty(pr.quote_from_source)
-                )
-                if any_nonempty:
-                    nonempty_any += 1
-                if _def_nonempty(pr.quote_from_source):
-                    nonempty_qsrc += 1
-                if _def_nonempty(pr.file_name_raw):
-                    nonempty_fname += 1
-                if _def_nonempty(pr.source_uri):
-                    url_count += 1
-                if _def_nonempty(pr.resolved_source_path):
-                    resolved_count += 1
-                if pr.extract_ok:
-                    extract_ok_count += 1
-                if _def_nonempty(pr.extract_error):
-                    extract_err_count += 1
-                if getattr(pr, "graph_like", False):
-                    graphlike_count += 1
+            futures = []
+            with ThreadPoolExecutor(max_workers=max(1, int(workers))) as ex:
+                for ridx, row in df.iterrows():
+                    futures.append(
+                        ex.submit(
+                            process_one_row,
+                            group,
+                            texts_dir,
+                            cohort_id,
+                            group_id,
+                            table_path,
+                            sheet,
+                            ridx,
+                            row,
+                            force_academic_pdf,
+                            grobid_url,
+                            grobid_rps,
+                            grobid_timeout,
+                            grobid_max_retries,
+                            url_map,
+                        )
+                    )
+
+                for fut in as_completed(futures):
+                    pr = fut.result()
+                    pairs.append(pr.__dict__)
+
+                    # Update stats
+                    any_nonempty = (
+                        _def_nonempty(pr.quote_from_report)
+                        or _def_nonempty(pr.file_name_raw)
+                        or _def_nonempty(pr.quote_from_source)
+                    )
+                    if any_nonempty:
+                        nonempty_any += 1
+                    if _def_nonempty(pr.quote_from_source):
+                        nonempty_qsrc += 1
+                    if _def_nonempty(pr.file_name_raw):
+                        nonempty_fname += 1
+                    if _def_nonempty(pr.source_uri):
+                        url_count += 1
+                    if _def_nonempty(pr.resolved_source_path):
+                        resolved_count += 1
+                    if pr.extract_ok:
+                        extract_ok_count += 1
+                    if _def_nonempty(pr.extract_error):
+                        extract_err_count += 1
+                    if getattr(pr, "graph_like", False):
+                        graphlike_count += 1
 
             stats_rows.append({
                 "cohort_id": cohort_id,
@@ -835,9 +971,14 @@ def build_all_pairs(
 
     pairs_df = pd.DataFrame(pairs)
 
+    # Cleanup: ensure parquet never contains sentinel strings
+    if not pairs_df.empty and "source_sha256" in pairs_df.columns:
+        pairs_df["source_sha256"] = pairs_df["source_sha256"].map(normalize_sha256)
+
     # Build sources_df: unique by sha256 (non-null)
     src_rows: List[Dict] = []
     if not pairs_df.empty and "source_sha256" in pairs_df.columns:
+        # Ensure we only build sources for valid sha256 identities
         uniq = pairs_df.dropna(subset=["source_sha256"]).drop_duplicates(subset=["source_sha256"])
         for _, r in uniq.iterrows():
             src_rows.append({
@@ -868,47 +1009,155 @@ def main():
     ap.add_argument("--parquet-dir", default=str(PARQUET_DIR), help="Directory to write parquet tables")
     ap.add_argument("--force-academic-pdf", action="store_true", help="Prefer GROBID for PDFs and save TEI/XML")
     ap.add_argument("--grobid-url", default="http://localhost:8070", help="GROBID service URL (default http://localhost:8070)")
+    ap.add_argument("--workers", type=int, default=6, help="Max concurrent workers for table row processing (default: 6)")
+    ap.add_argument("--grobid-rps", type=float, default=0.0, help="Throttle GROBID requests to RPS (0 disables throttling)")
+    ap.add_argument("--grobid-timeout", type=int, default=45, help="GROBID request timeout in seconds (default: 45)")
+    ap.add_argument("--grobid-max-retries", type=int, default=8, help="Max retries for transient GROBID failures (default: 8)")
     ap.add_argument("--consolidate-urls", action="store_true", help="Also write urls_manifest.parquet from per-group manifests")
     ap.add_argument("--urls-subdir", default="urls", help="Subdirectory for URL manifests (default: urls)")
     ap.add_argument("--prefer-excel", action="store_true", help="Prefer Excel files when present in a group")
     ap.add_argument("--fallback-csv", action="store_true", help="When preferring Excel, also use CSVs if no Excel files found")
     ap.add_argument("--csv-encoding-sweep", action="store_true", help="Try multiple encodings for CSV reading if needed")
+    ap.add_argument(
+        "--include-groups",
+        default="",
+        help=(
+            "Comma-separated group filters. Each token may be a full folder name (exact match) "
+            "or a group number like '5' (matches folders containing 'Group 5' case-insensitively). "
+            "If empty, all groups are processed."
+        ),
+    )
+
     args = ap.parse_args()
 
     root = Path(args.root).expanduser().resolve()
+    include_groups = _parse_include_groups(args.include_groups)
     text_dir = Path(args.texts_dir).expanduser().resolve()
     parquet_dir = Path(args.parquet_dir).expanduser().resolve()
     text_dir.mkdir(parents=True, exist_ok=True)
     parquet_dir.mkdir(parents=True, exist_ok=True)
 
     # Build URL map for resolving downloaded URLs
-    url_map = build_url_map(root, urls_subdir=args.urls_subdir)
-    # Build pairs + sources + per-table stats
+    url_map = build_url_map(root, urls_subdir=args.urls_subdir, include_groups=include_groups)   
     pairs_df, sources_df, stats_df = build_all_pairs(
         root=root,
         texts_dir=text_dir,
         force_academic_pdf=args.force_academic_pdf,
         grobid_url=args.grobid_url,
+        grobid_rps=args.grobid_rps,
+        grobid_timeout=args.grobid_timeout,
+        grobid_max_retries=args.grobid_max_retries,
         prefer_excel=args.prefer_excel,
         fallback_csv=args.fallback_csv,
         csv_encoding_sweep=args.csv_encoding_sweep,
         url_map=url_map,
+        workers=args.workers,
+        include_groups=include_groups,
     )
 
     # Persist
     if not pairs_df.empty:
+        if "source_sha256" in pairs_df.columns:
+            pairs_df["source_sha256"] = pairs_df["source_sha256"].map(normalize_sha256)
         pairs_out = parquet_dir / "pairs_raw.parquet"
         pairs_df.to_parquet(pairs_out, index=False)
         print(f"[OK] wrote {pairs_out}")
     else:
         print("[WARN] no pairs produced")
 
-    if not sources_df.empty:
-        sources_out = parquet_dir / "sources.parquet"
-        sources_df.to_parquet(sources_out, index=False)
+    sources_out = parquet_dir / "sources.parquet"
+
+    # If prior sources exist, merge them so build_pairs doesn't regress/lose state.
+    prev_sources = None
+    if sources_out.exists():
+        try:
+            prev_sources = pd.read_parquet(sources_out)
+            if "source_sha256" in prev_sources.columns:
+                prev_sources["source_sha256"] = prev_sources["source_sha256"].map(normalize_sha256)
+                prev_sources = prev_sources.dropna(subset=["source_sha256"])
+        except Exception as e:
+            print(f"[WARN] could not read existing {sources_out}: {e}", file=sys.stderr)
+
+    merged_sources = sources_df
+    if prev_sources is not None and not prev_sources.empty:
+        if merged_sources is None or merged_sources.empty:
+            merged_sources = prev_sources
+        else:
+            merged_sources = pd.concat([prev_sources, merged_sources], ignore_index=True)
+
+        # Deduplicate by sha; merge all_paths lists conservatively
+        if "source_sha256" in merged_sources.columns:
+            def _merge_paths(series: pd.Series) -> list:
+                out: list = []
+                for v in series.dropna().tolist():
+                    if isinstance(v, list):
+                        out.extend([str(x) for x in v if x])
+                    else:
+                        out.append(str(v))
+                # preserve order, unique
+                seen = set()
+                uniq = []
+                for p in out:
+                    if p not in seen:
+                        seen.add(p)
+                        uniq.append(p)
+                return uniq
+
+            # groupby merge
+            gb = merged_sources.groupby("source_sha256", dropna=True, as_index=False)
+            merged_sources = gb.agg({
+                **{c: "first" for c in merged_sources.columns if c not in {"all_paths", "source_sha256"}},
+                "all_paths": _merge_paths,
+            })
+
+    if merged_sources is not None and not merged_sources.empty:
+        merged_sources["source_sha256"] = merged_sources["source_sha256"].map(normalize_sha256)
+        merged_sources = merged_sources.dropna(subset=["source_sha256"])
+        merged_sources.to_parquet(sources_out, index=False)
         print(f"[OK] wrote {sources_out}")
     else:
-        print("[WARN] no sources produced")
+        # Actionable diagnostics
+        if pairs_df is None or pairs_df.empty:
+            print("[WARN] no sources produced (pairs_raw is empty)")
+        else:
+            resolved = int(pairs_df["resolved_source_path"].notna().sum()) if "resolved_source_path" in pairs_df.columns else 0
+            with_sha = int(pairs_df["source_sha256"].notna().sum()) if "source_sha256" in pairs_df.columns else 0
+            extract_ok = int(pairs_df["extract_ok"].fillna(False).sum()) if "extract_ok" in pairs_df.columns else 0
+            print(
+                "[WARN] no sources produced. Diagnostics: "
+                f"pairs={len(pairs_df)} resolved_paths={resolved} with_sha={with_sha} extract_ok={extract_ok}. "
+                "This usually means filenames could not be resolved to local files, or extraction never produced sha/text artifacts."
+            )
+
+    # --- SMOKE CHECK: pairs_raw source_sha256 all present in sources.parquet ---
+    # Use normalize_sha256 to normalize, treat null/None/Nan as missing
+    try:
+        pairs_shas = set(
+            pairs_df.get("source_sha256")
+            .map(normalize_sha256)
+            .dropna()
+            .tolist()
+        ) if "source_sha256" in pairs_df.columns else set()
+
+        if sources_out.exists():
+            sources_df_chk = pd.read_parquet(sources_out)
+        else:
+            sources_df_chk = pd.DataFrame()
+        sources_shas = set(
+            sources_df_chk.get("source_sha256")
+            .map(normalize_sha256)
+            .dropna()
+            .tolist()
+        ) if "source_sha256" in sources_df_chk.columns else set()
+
+        missing = sorted(pairs_shas - sources_shas)
+        if missing:
+            print(f"[SMOKE FAIL] pairs_raw contains source_sha256 not found in sources.parquet: {missing[:25]}")
+            sys.exit(1)
+        else:
+            print("[OK] pairs_raw source_sha256 values all present in sources.parquet")
+    except Exception as e:
+        print(f"[WARN] smoke check failed with error: {e}")
 
     # Per-table QA report
     if not stats_df.empty:
@@ -930,17 +1179,22 @@ def main():
                     f"nonempty={int(r['nonempty_rows'])}  extract_ok={int(r['extract_ok_count'])}  "
                     f"success={r['extract_success_ratio']:.2%}  resolved={r['resolved_ratio']:.2%}"
                 )
-    else:
-        print("[WARN] no stats generated")
 
+    # Consolidated URL manifest (optional)
     if args.consolidate_urls:
         urls_df = consolidate_url_manifests(root, urls_subdir=args.urls_subdir)
+        if include_groups:
+            # Filter to included groups only
+            urls_df = urls_df[urls_df["group_id"].apply(lambda g: _group_selected(g, include_groups))]
         if not urls_df.empty:
             urls_out = parquet_dir / "urls_manifest.parquet"
             urls_df.to_parquet(urls_out, index=False)
             print(f"[OK] wrote {urls_out}")
         else:
             print("[INFO] no URL manifests to consolidate")
+    else:
+        if stats_df.empty:
+            print("[WARN] no stats generated")
 
 if __name__ == "__main__":
     main()
