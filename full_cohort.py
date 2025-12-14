@@ -16,11 +16,15 @@ def run(cmd: list[str]):
         sys.exit(res.returncode)
 
 def main():
-    ap = argparse.ArgumentParser(description="Full authoritative rebuild for one cohort")
+    ap = argparse.ArgumentParser(
+        description="Full authoritative rebuild for one cohort. The --cohort-id argument is mandatory and is used for cross-run provenance."
+    )
     ap.add_argument("root", help="Root directory of cohort submissions")
     ap.add_argument("--wipe", action="store_true", help="Delete existing artifacts before running")
     ap.add_argument("--grobid-url", default="http://localhost:8070")
     ap.add_argument("--cheap-only", action="store_true", help="Skip NLI in cherry-picking sniff")
+    ap.add_argument("--cohort-id", required=True, help="Cohort identifier for cross-run provenance (required)")
+    ap.add_argument("--cohort-note", default=None, help="Optional note describing the academic context of this cohort")
     args = ap.parse_args()
 
     # Ensure stdout is unbuffered (better progress visibility in long runs)
@@ -37,13 +41,17 @@ def main():
     (artifacts / "verification").mkdir(parents=True, exist_ok=True)
     (artifacts / "cherrypicking").mkdir(parents=True, exist_ok=True)
 
-    run([
+    extract_cmd = [
         sys.executable, "extract_text.py", args.root,
         "--texts-dir", "artifacts/text",
         "--parquet-dir", "artifacts/parquet",
         "--extensions", ".pdf,.docx,.html,.htm,.txt,.md,.rst",
-        "--grobid-url", args.grobid_url
-    ])
+        "--grobid-url", args.grobid_url,
+        "--cohort-id", args.cohort_id,
+    ]
+    if args.cohort_note is not None:
+        extract_cmd.extend(["--cohort-note", args.cohort_note])
+    run(extract_cmd)
 
     run([
         sys.executable, "build_pairs.py", args.root,
