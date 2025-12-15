@@ -41,6 +41,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import csv
 from pathlib import Path
 from typing import Dict, Any, List, Tuple
 
@@ -340,7 +341,13 @@ def main():
     print(f"[OUT] {out_scored_parquet}")
 
     out_scored_csv = out_dir / "nli_results.csv"
-    df_scored.to_csv(out_scored_csv, index=False)
+    df_scored.to_csv(
+        out_scored_csv,
+        index=False,
+        encoding="utf-8",
+        quoting=csv.QUOTE_ALL,
+        escapechar="\\",
+    )
     print(f"[OUT] {out_scored_csv}")
 
     # (2) merged convenience file (preserve non-run rows with NaNs)
@@ -399,7 +406,13 @@ def main():
     )
 
     out_csv = out_dir / "nli_summary.csv"
-    summ.to_csv(out_csv, index=False)
+    summ.to_csv(
+        out_csv,
+        index=False,
+        encoding="utf-8",
+        quoting=csv.QUOTE_ALL,
+        escapechar="\\",
+    )
     print(f"[OUT] {out_csv}")
 
     # Teacher JSON

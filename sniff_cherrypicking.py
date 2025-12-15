@@ -326,6 +326,66 @@ def embed_rerank(
 
 
 
+
+def resolve_text_path(texts_dir: Path, sha: str, row: pd.Series, sha_to_text: dict) -> str:
+    """Resolve the extracted text sidecar path for a sha.
+
+    Portability rules (in order):
+      1) Prefer `{texts_dir}/{sha}.txt` if it exists.
+      2) Else, if `sources.parquet` (or pairs_raw) provides an absolute path, try:
+         - that absolute path if it exists, otherwise
+         - `{texts_dir}/{basename}` (rebasing across machines).
+      3) Else, try any `{texts_dir}/{sha}.*` match (e.g., .txt.gz).
+
+    Returns empty string if nothing exists.
+    """
+    sha = str(sha).strip()
+    if not sha:
+        return ""
+
+    # 1) Preferred portable location
+    p1 = texts_dir / f"{sha}.txt"
+    if p1.exists():
+        return str(p1)
+
+    # Helper: try an absolute path and then a rebased basename under texts_dir
+    def _try_abs_then_rebase(path_str: Optional[str]) -> str:
+        if not isinstance(path_str, str) or not path_str:
+            return ""
+        p = Path(path_str)
+        if p.exists():
+            return str(p)
+        # Rebase: same filename, different root
+        pb = texts_dir / p.name
+        if pb.exists():
+            return str(pb)
+        return ""
+
+    # 2) If pairs_raw carries a concrete path, try it (and rebase basename)
+    try:
+        rtp = row.get("source_text_path")
+    except Exception:
+        rtp = None
+    got = _try_abs_then_rebase(rtp)
+    if got:
+        return got
+
+    # 2b) Try sources.parquet mapping (may be absolute and non-portable)
+    got = _try_abs_then_rebase(sha_to_text.get(sha))
+    if got:
+        return got
+
+    # 3) Any extension under texts_dir (last resort)
+    matches = sorted(texts_dir.glob(f"{sha}.*"))
+    if matches:
+        for m in matches:
+            if m.suffix.lower() == ".txt":
+                return str(m)
+        return str(matches[0])
+
+    return ""
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--parquet-dir", required=True, help="Directory containing pairs_raw.parquet and sources.parquet")
@@ -371,25 +431,33 @@ def main():
         print(f"[FAIL] pairs_raw missing columns: {missing}", file=sys.stderr)
         sys.exit(2)
 
-    # Map sha -> text_path (or fallback to texts_dir/<sha>.txt)
-    sha_to_text = {}
-    if "text_path" in sources.columns:
+    # Map sha -> text_path from sources.parquet.
+    # sources.parquet schema varies over time; accept either 'text_path' or 'source_text_path'.
+    sha_to_text: Dict[str, str] = {}
+    text_col = None
+    for c in ["text_path", "source_text_path"]:
+        if c in sources.columns:
+            text_col = c
+            break
+
+    if text_col:
         for _, r in sources.iterrows():
-            sha = str(r.get("source_sha256") or "")
-            tp = r.get("text_path")
-            if sha and isinstance(tp, str) and tp:
-                sha_to_text[sha] = tp
+            sha0 = str(r.get("source_sha256") or "").strip()
+            tp = r.get(text_col)
+            if not sha0 or not isinstance(tp, str) or not tp:
+                continue
+            # Store the path string even if it's absolute/non-portable; resolve_text_path() will
+            # try the absolute path and then rebase to `{texts_dir}/{basename}`.
+            sha_to_text[sha0] = tp
 
     # Initialize embedding model once
     embed_model_name = cfg["embed_model"]
     embedder = SentenceTransformer(embed_model_name)
 
-
     # Cache per-doc indices (windows + bm25) to avoid recompute
     doc_cache: Dict[str, Tuple[List[str], BM25Okapi]] = {}
 
     hits: List[CandidateHit] = []
-    n_rows = len(pairs)
     limit = int(args.limit_rows or 0)
     if limit > 0:
         pairs = pairs.head(limit)
@@ -418,20 +486,16 @@ def main():
         cohort_id = str(row.get("cohort_id") or "")
         group_id = str(row.get("group_id") or row.get("group") or "")
 
-        # Load source text
-        tp = sha_to_text.get(sha)
+        # Load source text (portable resolution)
+        tp = resolve_text_path(texts_dir=texts_dir, sha=sha, row=row, sha_to_text=sha_to_text)
         if not tp:
-            # default location
-            cand = texts_dir / f"{sha}.txt"
-            tp = str(cand) if cand.exists() else ""
-        if not tp or not Path(tp).exists():
             skipped_missing_text += 1
             continue
 
         src_path = str(row.get("resolved_source_path") or row.get("source_path") or "")
         source_text = Path(tp).read_text(encoding="utf-8", errors="ignore")
         if len(source_text) > int(cfg["max_source_chars"]):
-            source_text = source_text[: int(cfg["max_source_chars"])]
+            source_text = source_text[: int(cfg["max_source_chars"]) ]
 
         # Build/reuse doc index
         if sha not in doc_cache:
@@ -464,7 +528,6 @@ def main():
             if negation_hits >= int(cfg["recommend_nli_if_negation_hits"]):
                 recommend = True
 
-            # bm25 rank among all windows (approx): use w_idx ordering by score
             bm25_rank = int(np.where(np.argsort(-scores) == w_idx)[0][0]) if len(scores) else -1
 
             cand_id = make_candidate_id(
@@ -500,7 +563,6 @@ def main():
             ))
 
         processed += 1
-
 
     # Write outputs
     out_rows = []
@@ -566,10 +628,7 @@ def main():
         summary.to_csv(summ_path, index=False)
 
         # Teacher view: keep only the most useful candidates per row
-        # Priority: recommend_nli, then high cosine.
         df_teacher = df_out.copy()
-
-        # Make shorter text fields for quick scanning
         df_teacher["claim_short"] = df_teacher["query_text"].apply(lambda s: shorten(str(s), 240))
         df_teacher["cited_short"] = df_teacher["quote_from_source"].apply(lambda s: shorten(str(s), 240))
         df_teacher["candidate_short"] = df_teacher["candidate_window"].apply(lambda s: shorten(str(s), 320))
@@ -578,7 +637,6 @@ def main():
             ["group_id", "row_id", "recommend_nli", "embed_cosine", "bm25_score"],
             ascending=[True, True, False, False, False],
         )
-        # top 3 candidates per row is usually enough for a teacher pass
         df_teacher = df_teacher.groupby(["group_id", "row_id"], dropna=False).head(3)
 
         teacher_cols = [
@@ -609,21 +667,8 @@ def main():
             escapechar="\\",
         )
 
-        # JSON report: nested for UI (group -> row -> list of candidates)
+        # JSON report: nested for UI
         report: Dict[str, dict] = {"groups": {}}
-        # Pull one row-level record per (group_id,row_id)
-        base_cols = [
-            "cohort_id",
-            "group_id",
-            "row_id",
-            "source_sha256",
-            "source_path",
-            "query_field",
-            "query_text",
-            "quote_from_report",
-            "quote_from_source",
-        ]
-        # Use teacher-filtered candidates for the report (keeps size sane)
         for (g, rid), sub in df_teacher.groupby(["group_id", "row_id"], dropna=False):
             gk = str(g)
             rk = str(int(rid))
@@ -661,7 +706,7 @@ def main():
 
     # Console guidance
     total_reco = int(df_out["recommend_nli"].sum()) if len(df_out) else 0
-    print(f"=== Cherry-picking sniff (cheap) ===")
+    print("=== Cherry-picking sniff (cheap) ===")
     print(f"[OK] processed_rows={processed} candidates={len(df_out)} recommend_nli={total_reco}")
     print(f"[SKIP] no_sha={skipped_no_sha} short_claim={skipped_short_claim} missing_text={skipped_missing_text}")
     print(f"[OUT] {cand_path}")
@@ -672,17 +717,13 @@ def main():
     if total_reco > 0:
         print("\nNLI looks potentially useful on flagged candidates.")
         print("Proposed rerun:")
-
-        qf = f" --query-field {query_field}"
-        lim = f" --limit-rows {args.limit_rows}" if args.limit_rows else ""
-
-    print(
-        "python nli_cherrypicking.py "
-        f"--candidates-parquet {out_dir}/cherrypicking_candidates.parquet "
-        f"--out-dir {out_dir} "
-        f"--flagged-only "
-        f"--nli-model \"{cfg['nli_model']}\""
-    )
+        print(
+            "python nli_cherrypicking.py "
+            f"--candidates-parquet {out_dir}/cherrypicking_candidates.parquet "
+            f"--out-dir {out_dir} "
+            f"--flagged-only "
+            f"--nli-model \"{cfg['nli_model']}\""
+        )
 
 
 if __name__ == "__main__":

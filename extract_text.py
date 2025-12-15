@@ -647,10 +647,14 @@ if __name__ == "__main__":
     parser.add_argument("--out-root", type=str, default=None, help="Cohort output root; when set, parquet goes to <out-root>/parquet.")
     parser.add_argument("--store-dir", type=str, default=None, help="Global store root; when set, artifacts go to <store-dir>/text and <store-dir>/meta.")
     parser.add_argument("--cohort-id", type=str, default=None, help="Cohort identifier recorded in sources.parquet (default derives from out-root name).")
+    parser.add_argument("--cohort-note", type=str, default=None,
+                        help="Short human-readable description of the cohort/class; stored in sources.parquet.")
     parser.add_argument("--grobid-url", type=str, default="http://localhost:8070", help="Base URL of the GROBID service.")
     parser.add_argument("--force-academic-pdf", action="store_true", help="Try GROBID first for PDFs (assume academic PDFs).")
     parser.add_argument("--prefer-ocr", action="store_true", help="If PDF text looks sparse, allow OCR sidecar and prefer it when longer.")
     parser.add_argument("--reextract", action="store_true", help="Overwrite existing text/tei artifacts; otherwise skip files already extracted.")
+    parser.add_argument("--no-merge-manifest", action="store_true",
+                        help="Do not merge with an existing sources.parquet; overwrite it with only this run's records.")
     parser.add_argument("--extensions", type=str, default=".pdf,.docx,.html,.htm,.txt,.md,.rst", help="Comma-separated list of file extensions to process.")
     parser.add_argument("--verify", action="store_true", help="After (or without) extraction, print a per-group verification report.")
     parser.add_argument("--verify-only", action="store_true", help="Do not extract; only build/print a verification report against existing artifacts/parquet.")
@@ -693,6 +697,7 @@ if __name__ == "__main__":
     else:
         from datetime import datetime, timezone
         cohort_id = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S%z")
+    cohort_note = args.cohort_note
 
     # Allow passing a single file path as `root`.
     root_is_file = root.is_file()
@@ -811,25 +816,38 @@ if __name__ == "__main__":
             except Exception as e:
                 print(f"[VERIFY] Could not write report: {e}")
 
-    def write_artifacts(src_path: Path, out: Dict[str, object]):
-        sha = out.get("sha256")
+    def write_artifacts(src_path: Path, out: Dict[str, object]) -> tuple[Optional[str], Optional[str]]:
+        """Write content-addressed sidecar artifacts.
+
+        Returns (text_path_str_or_none, tei_path_str_or_none) for what was actually written/present.
+        """
+        sha = (out.get("sha256") or "").strip().lower()
         if not sha:
-            return
+            return (None, None)
+
         txt_path = texts_dir / f"{sha}.txt"
         tei_path = texts_dir / f"{sha}.tei.xml"
 
-        # Respect --reextract: only skip if both targets exist and user didn't request overwrite
-        if not args.reextract and txt_path.exists() and tei_path.exists():
-            return
-
-        # Write text if present (empty string is treated as absent)
         text = out.get("text")
-        if text:
-            txt_path.write_text(text, encoding="utf-8", errors="ignore")
-        # Write TEI if present
         tei_xml = out.get("tei_xml")
-        if tei_xml:
-            tei_path.write_text(tei_xml, encoding="utf-8", errors="ignore")
+
+        wrote_txt = False
+        wrote_tei = False
+
+        # If not reextract, only write missing artifacts; if reextract, overwrite.
+        try:
+            if isinstance(text, str) and text.strip():
+                if args.reextract or (not txt_path.exists()):
+                    txt_path.write_text(text, encoding="utf-8", errors="ignore")
+                    wrote_txt = True
+            if isinstance(tei_xml, str) and tei_xml.strip():
+                if args.reextract or (not tei_path.exists()):
+                    tei_path.write_text(tei_xml, encoding="utf-8", errors="ignore")
+                    wrote_tei = True
+        except Exception as e:
+            # Record the failure but do not crash the whole run.
+            log.debug(f"write_artifacts failed for sha={sha} path={src_path}: {e}")
+
         # Optional: write per-source provenance metadata into the global store
         if meta_dir is not None:
             try:
@@ -841,11 +859,28 @@ if __name__ == "__main__":
                     "ocr_used": bool(out.get("ocr_used")),
                     "timings": out.get("timings", {}),
                     "grobid_url": args.grobid_url if hasattr(args, "grobid_url") else None,
+                    "cohort_id": cohort_id,
+                    "cohort_note": cohort_note,
                 }
-                meta_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
-                                    encoding="utf-8", errors="ignore")
+                meta_path.write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                    errors="ignore",
+                )
             except Exception:
                 pass
+
+        # Return what exists on disk now.
+        txt_out = str(txt_path) if txt_path.exists() else None
+        tei_out = str(tei_path) if tei_path.exists() else None
+
+        # If we expected to write something but it still doesn't exist, warn loudly.
+        if isinstance(text, str) and text.strip() and txt_out is None:
+            print(f"[WARN] expected text sidecar missing after write: {txt_path}")
+        if isinstance(tei_xml, str) and tei_xml.strip() and tei_out is None:
+            print(f"[WARN] expected TEI sidecar missing after write: {tei_path}")
+
+        return (txt_out, tei_out)
     # For verification we collect all eligible source paths, even when not extracting.
     all_expected_paths: set[str] = set()
     files_to_extract: list[Path] = []
@@ -946,6 +981,7 @@ if __name__ == "__main__":
                 "extract_ok": False,
                 "extract_error": str(err),
                 "cohort_id": cohort_id,
+                "cohort_note": cohort_note,
                 "group_id": group_from_path(fpath, root_dir_for_group),
                 "group": group_from_path(fpath, root_dir_for_group),
             })
@@ -958,7 +994,7 @@ if __name__ == "__main__":
         if not sha:
             print(f"[WARN] No sha produced for {fpath}")
             continue
-        write_artifacts(fpath, out)
+        actual_txt_path, actual_tei_path = write_artifacts(fpath, out)
         rec = {
             "source_sha256": sha,
             "canonical_ext": fpath.suffix.lower().lstrip("."),
@@ -966,13 +1002,14 @@ if __name__ == "__main__":
             "mime": None,
             "first_seen_path": str(fpath),
             "all_paths": [str(fpath)],
-            "text_path": str((texts_dir / f"{sha}.txt")) if out.get("text") else None,
-            "tei_path": str((texts_dir / f"{sha}.tei.xml")) if out.get("tei_xml") else None,
+            "text_path": actual_txt_path,
+            "tei_path": actual_tei_path,
             "extract_tool": out.get("extract_tool"),
             "ocr_used": bool(out.get("ocr_used")),
-            "extract_ok": bool(out.get("text") or out.get("tei_xml")),
+            "extract_ok": bool(actual_txt_path or actual_tei_path),
             "extract_error": None,
             "cohort_id": cohort_id,
+            "cohort_note": cohort_note,
             "group_id": group_from_path(fpath, root_dir_for_group),
             "group": group_from_path(fpath, root_dir_for_group),
             "timings": out.get("timings", {}),
@@ -987,10 +1024,15 @@ if __name__ == "__main__":
         else:
             records.append(rec)
             seen_sha.add(sha)
-        # Print per-stage timing logs
+        # Print per-stage timing logs (reflect real success: whether any artifact exists)
         timing_info = out.get("timings", {})
         timing_str = " ".join([f"{k}={v:.2f}s" for k, v in timing_info.items() if isinstance(v, (int, float))])
-        print(f"[OK] extracted {fpath}  → sha={sha[:8]} tool={rec['extract_tool']} ocr={rec['ocr_used']} timings: {timing_str}")
+
+        if rec["extract_ok"]:
+            print(f"[OK] extracted {fpath}  → sha={sha[:8]} tool={rec['extract_tool']} ocr={rec['ocr_used']} timings: {timing_str}")
+        else:
+            # This includes unsupported binaries and parse failures (e.g., missing bs4), where we produced no sidecar.
+            print(f"[MISS] no sidecar written for {fpath}  → sha={sha[:8]} tool={rec['extract_tool']} timings: {timing_str}")
 
     # Run verification if requested (or if verify-only)
     if args.verify or args.verify_only:
@@ -998,9 +1040,84 @@ if __name__ == "__main__":
         run_verification(all_expected_paths, df_for_verify)
 
     if records:
-        df = pd.DataFrame.from_records(records)
+        df_new = pd.DataFrame.from_records(records)
         out_path = parquet_dir / "sources.parquet"
-        df.to_parquet(out_path, index=False)
-        print(f"[OK] wrote manifest {out_path}  rows={len(df)}")
+
+        # By default, merge with existing manifest so extension-limited re-runs don't wipe earlier rows.
+        df_out = df_new
+        if (not args.no_merge_manifest) and out_path.exists():
+            try:
+                df_old = pd.read_parquet(out_path)
+
+                # Concatenate then merge by sha, unioning all_paths and preferring non-null fields.
+                df_cat = pd.concat([df_old, df_new], ignore_index=True)
+
+                def _merge_group(g: pd.DataFrame) -> pd.Series:
+                    # Prefer earliest first_seen_path for stability
+                    first_seen = g["first_seen_path"].dropna().astype(str).iloc[0] if g["first_seen_path"].notna().any() else None
+
+                    # Union all_paths (handle None/str/list/numpy)
+                    paths = set()
+                    for v in g.get("all_paths", pd.Series([], dtype=object)).dropna().tolist():
+                        if v is None:
+                            continue
+                        if isinstance(v, str):
+                            paths.add(v)
+                        elif hasattr(v, "tolist"):
+                            for p in v.tolist():
+                                paths.add(str(p))
+                        elif isinstance(v, (list, tuple, set)):
+                            for p in v:
+                                paths.add(str(p))
+                        else:
+                            paths.add(str(v))
+                    all_paths = sorted(paths)
+
+                    # For other columns, take the last non-null value (newer run wins), except extract_ok which is OR.
+                    out = {}
+                    for col in g.columns:
+                        if col in ("all_paths", "first_seen_path"):
+                            continue
+                        if col == "extract_ok":
+                            out[col] = bool(g["extract_ok"].fillna(False).any())
+                            continue
+                        # last non-null wins
+                        nn = g[col].dropna()
+                        out[col] = nn.iloc[-1] if len(nn) else None
+
+                    out["first_seen_path"] = first_seen
+                    out["all_paths"] = all_paths
+                    return pd.Series(out)
+
+                if "source_sha256" in df_cat.columns:
+                    # Pandas is deprecating GroupBy.apply operating on grouping columns.
+                    # Newer pandas supports include_groups=False; older versions do not.
+                    gb = df_cat.groupby("source_sha256", dropna=False, sort=False)
+                    try:
+                        df_out = gb.apply(_merge_group, include_groups=False)
+                    except TypeError:
+                        # Fallback for older pandas
+                        df_out = gb.apply(_merge_group)
+
+                    # groupby+apply creates a multiindex with the group key; normalize to a clean frame.
+                    df_out = df_out.reset_index(drop=False)
+                    # Ensure we have a plain 'source_sha256' column.
+                    if "source_sha256" not in df_out.columns:
+                        # Some pandas versions name it 'level_0'
+                        if "level_0" in df_out.columns:
+                            df_out = df_out.rename(columns={"level_0": "source_sha256"})
+                    # Drop any accidental index columns introduced by reset_index
+                    for c in ["level_1", "index"]:
+                        if c in df_out.columns:
+                            df_out = df_out.drop(columns=[c])
+                else:
+                    df_out = df_cat
+
+            except Exception as e:
+                print(f"[WARN] Could not merge existing manifest {out_path}: {e}")
+                df_out = df_new
+
+        df_out.to_parquet(out_path, index=False)
+        print(f"[OK] wrote manifest {out_path}  rows={len(df_out)}")
     else:
         print("[INFO] No supported files found during extraction.")
